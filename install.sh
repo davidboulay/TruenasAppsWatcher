@@ -21,7 +21,7 @@ latest_tag() {
 }
 
 install_macos() {
-    local ZIP="TrueNAS-Apps-Watcher-macOS.zip"
+    local DMG="TrueNAS-Apps-Watcher.dmg"
     local APP="TrueNAS Apps Watcher.app"
 
     local tag
@@ -32,12 +32,15 @@ install_macos() {
     local tmp
     tmp=$(mktemp -d)
     trap 'rm -rf "$tmp"' EXIT
-    curl -fsSL "https://github.com/$REPO/releases/download/$tag/$ZIP" -o "$tmp/$ZIP"
+    curl -fsSL "https://github.com/$REPO/releases/download/$tag/$DMG" -o "$tmp/$DMG"
 
     msg "Installing to /Applications…"
-    ditto -x -k "$tmp/$ZIP" "$tmp"
+    local mount
+    mount=$(hdiutil attach -nobrowse -readonly "$tmp/$DMG" | awk -F'\t' '/\/Volumes\//{print $NF; exit}')
+    [ -d "$mount/$APP" ] || { err "app not found in disk image"; exit 1; }
     rm -rf "/Applications/$APP"
-    mv "$tmp/$APP" "/Applications/$APP"
+    ditto "$mount/$APP" "/Applications/$APP"
+    hdiutil detach -quiet "$mount" || true
     # The app is ad-hoc signed, not notarized.
     xattr -dr com.apple.quarantine "/Applications/$APP" 2>/dev/null || true
 

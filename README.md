@@ -104,8 +104,12 @@ Notes on the apt install:
 
 **macOS**: installs **TrueNAS Apps Watcher.app** (universal binary) to
 /Applications, clears the quarantine flag (the app is ad-hoc signed, not
-notarized — if you install by hand, right-click → **Open** the first time),
-and launches it. Look for the blue NAS icon in the menu bar.
+notarized), and launches it. Look for the blue NAS icon in the menu bar.
+
+Prefer doing it by hand? Download **TrueNAS-Apps-Watcher.dmg** from the
+[latest release](https://github.com/davidboulay/TruenasAppsWatcher/releases/latest),
+open it and drag the app onto the Applications folder, then right-click →
+**Open** the first time (unsigned-app prompt).
 
 Then click the icon, open Settings (⚙) and enter the server address and API
 key.

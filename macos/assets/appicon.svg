@@ -1,0 +1,35 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2CB5E8"/>
+      <stop offset="0.55" stop-color="#0095D5"/>
+      <stop offset="1" stop-color="#006DA3"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- macOS rounded-square tile -->
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#bg)"/>
+  <!-- top sheen for a little depth -->
+  <rect x="100" y="100" width="824" height="330" rx="186" fill="url(#sheen)"/>
+
+  <!-- NAS chassis (two drive bays + update arrow knocked out), white -->
+  <path fill="#FFFFFF" fill-rule="evenodd" d="
+    M336 226
+    H688
+    A66 66 0 0 1 754 292
+    V732
+    A66 66 0 0 1 688 798
+    H336
+    A66 66 0 0 1 270 732
+    V292
+    A66 66 0 0 1 336 226
+    Z
+    M358 314 H666 V367 H358 Z
+    M358 424 H666 V477 H358 Z
+    M512 512 L630.8 661.6 H560.4 V740.8 H463.6 V661.6 H393.2 Z
+  "/>
+</svg>

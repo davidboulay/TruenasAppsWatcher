@@ -9,8 +9,9 @@ BIN="${1:-.build/apple/Products/Release/TruenasAppsWatcher}"
 
 APP="dist/TrueNAS Apps Watcher.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp Info.plist "$APP/Contents/Info.plist"
+cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp "$BIN" "$APP/Contents/MacOS/TruenasAppsWatcher"
 
 # Ad-hoc signature: not notarized, but keeps Gatekeeper's messaging sane and

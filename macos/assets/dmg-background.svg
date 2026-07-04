@@ -1,0 +1,32 @@
+<svg width="600" height="400" viewBox="0 0 600 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#F7FBFD"/>
+      <stop offset="1" stop-color="#E2EEF5"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="600" height="400" fill="url(#bg)"/>
+
+  <!-- subtle brand band at the bottom -->
+  <rect y="392" width="600" height="8" fill="#0095D5"/>
+
+  <!-- small NAS mark, top center -->
+  <g transform="translate(284,28) scale(2)">
+    <path fill="#0095D5" fill-rule="evenodd" d="M4 1.5 H12 A1.5 1.5 0 0 1 13.5 3 V13 A1.5 1.5 0 0 1 12 14.5 H4 A1.5 1.5 0 0 1 2.5 13 V3 A1.5 1.5 0 0 1 4 1.5 Z M4.5 3.5 H11.5 V4.7 H4.5 Z M4.5 6 H11.5 V7.2 H4.5 Z M8 8 L10.7 11.4 H9.1 V13.2 H6.9 V11.4 H5.3 Z"/>
+  </g>
+
+  <text x="300" y="92" text-anchor="middle" font-family="DejaVu Sans, Helvetica, Arial, sans-serif"
+        font-size="24" font-weight="bold" fill="#1B3A4B">TrueNAS Apps Watcher</text>
+
+  <!-- arrow between the app icon (150,185) and the Applications link (450,185) -->
+  <g stroke="#0095D5" stroke-width="5" fill="none" stroke-linecap="round">
+    <line x1="235" y1="192" x2="352" y2="192"/>
+  </g>
+  <path fill="#0095D5" d="M352 176 L384 192 L352 208 Z"/>
+
+  <text x="300" y="330" text-anchor="middle" font-family="DejaVu Sans, Helvetica, Arial, sans-serif"
+        font-size="15" fill="#4A6572">Drag the app onto the Applications folder to install</text>
+  <text x="300" y="356" text-anchor="middle" font-family="DejaVu Sans, Helvetica, Arial, sans-serif"
+        font-size="12" fill="#8AA0AC">Then look for the blue NAS icon in the menu bar</text>
+</svg>
