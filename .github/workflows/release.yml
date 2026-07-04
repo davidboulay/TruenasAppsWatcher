@@ -1,18 +1,44 @@
-name: Release
+name: Build & Release
 
-# Builds the applet and publishes the binary as a release asset whenever a
-# version tag (e.g. v0.1.0) is pushed. Can also be run manually.
+# The macOS app builds on every push (that's this repo's compile check for
+# Swift). On a version tag, both platforms build and a single release is
+# published carrying the COSMIC applet binary + desktop file and the zipped
+# macOS menu bar app.
 on:
   push:
-    tags:
-      - "v*"
+    branches: ["main"]
+    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-and-release:
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (release, universal)
+        working-directory: macos
+        run: swift build -c release --arch arm64 --arch x86_64
+
+      - name: Assemble .app bundle
+        working-directory: macos
+        run: ./scripts/make_app.sh
+
+      - name: Zip
+        working-directory: macos
+        run: ditto -c -k --keepParent "dist/TrueNAS Apps Watcher.app" "dist/TrueNAS-Apps-Watcher-macOS.zip"
+
+      - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: macos
+          path: macos/dist/TrueNAS-Apps-Watcher-macOS.zip
+
+  linux:
+    if: startsWith(github.ref, 'refs/tags/')
     # Match Pop!_OS 24.04's glibc so the binary runs on the target.
     runs-on: ubuntu-24.04
     steps:
@@ -28,20 +54,36 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cosmic
 
       - name: Build (release)
+        working-directory: cosmic
         run: cargo build --release --locked
 
-      - name: Stage release assets
+      - name: Stage assets
         run: |
           mkdir -p dist
-          cp target/release/cosmic-applet-truenas-apps dist/
-          cp data/com.github.davidboulay.CosmicAppletTruenasApps.desktop dist/
+          cp cosmic/target/release/cosmic-applet-truenas-apps dist/
+          cp cosmic/data/com.github.davidboulay.CosmicAppletTruenasApps.desktop dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [macos, linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            dist/cosmic-applet-truenas-apps
-            dist/com.github.davidboulay.CosmicAppletTruenasApps.desktop
+          files: dist/*
           generate_release_notes: true
