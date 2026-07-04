@@ -61,11 +61,19 @@ jobs:
         working-directory: cosmic
         run: cargo build --release --locked
 
+      - name: Package .deb
+        working-directory: cosmic
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb --no-build
+
       - name: Stage assets
         run: |
           mkdir -p dist
           cp cosmic/target/release/cosmic-applet-truenas-apps dist/
           cp cosmic/data/com.github.davidboulay.CosmicAppletTruenasApps.desktop dist/
+          # Stable asset name so releases/latest/download/… always works.
+          cp cosmic/target/debian/truenas-apps-watcher_*.deb dist/truenas-apps-watcher_amd64.deb
 
       - uses: actions/upload-artifact@v4
         with:

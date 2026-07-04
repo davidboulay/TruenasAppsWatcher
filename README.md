@@ -81,6 +81,27 @@ curl -fsSL https://raw.githubusercontent.com/davidboulay/TruenasAppsWatcher/main
 **Settings → Desktop → Panel (or Dock) → Add Applet → "TrueNAS Apps
 Watcher"**.
 
+### Linux: install with apt (.deb) instead
+
+Every release also ships a Debian package (amd64) — the right choice if you
+prefer a system-managed install on Pop!_OS / Ubuntu-based distros:
+
+```sh
+curl -fsSLO https://github.com/davidboulay/TruenasAppsWatcher/releases/latest/download/truenas-apps-watcher_amd64.deb
+sudo apt install ./truenas-apps-watcher_amd64.deb
+```
+
+Remove it again with `sudo apt remove truenas-apps-watcher`.
+
+Notes on the apt install:
+- The applet's built-in **"Automatically update the applet"** only works for
+  user-local installs (the curl installer above) — a deb-managed binary in
+  `/usr/bin` isn't writable by your session. To update, download and
+  `apt install` the newer .deb the same way.
+- If you previously used the curl installer, remove the user-local copy so
+  it doesn't shadow the packaged one:
+  `rm ~/.local/bin/cosmic-applet-truenas-apps ~/.local/share/applications/com.github.davidboulay.CosmicAppletTruenasApps.desktop`
+
 **macOS**: installs **TrueNAS Apps Watcher.app** (universal binary) to
 /Applications, clears the quarantine flag (the app is ad-hoc signed, not
 notarized — if you install by hand, right-click → **Open** the first time),

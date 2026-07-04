@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-applet-truenas-apps"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "TrueNAS Apps Watcher — a COSMIC panel applet that watches a TrueNAS server (and optionally Portainer) for pending Docker app updates and can apply them."
@@ -32,3 +32,19 @@ tracing-log = "0.2"
 [profile.release]
 lto = "thin"
 opt-level = 2
+
+# `cargo deb` packaging (the .deb attached to GitHub releases).
+[package.metadata.deb]
+name = "truenas-apps-watcher"
+maintainer = "David Boulay <davidboulay@users.noreply.github.com>"
+copyright = "David Boulay, GPL-3.0-only"
+section = "utils"
+priority = "optional"
+extended-description = """\
+A COSMIC panel applet that watches a TrueNAS SCALE server (and optionally \
+Portainer) for pending Docker app updates and can apply them from the panel."""
+assets = [
+    ["target/release/cosmic-applet-truenas-apps", "usr/bin/", "755"],
+    ["data/com.github.davidboulay.CosmicAppletTruenasApps.desktop", "usr/share/applications/", "644"],
+    ["../README.md", "usr/share/doc/truenas-apps-watcher/README.md", "644"],
+]
