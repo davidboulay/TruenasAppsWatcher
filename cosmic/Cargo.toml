@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-applet-truenas-apps"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "TrueNAS Apps Watcher — a COSMIC panel applet that watches a TrueNAS server (and optionally Portainer) for pending Docker app updates and can apply them."

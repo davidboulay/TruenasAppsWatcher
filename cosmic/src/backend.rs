@@ -29,13 +29,27 @@ impl Connection {
         !self.base_url.trim().is_empty() && !self.api_key.trim().is_empty()
     }
 
-    /// Base with a scheme and no trailing slash; bare hosts default to https.
+    /// Base with a scheme and no trailing slash; bare hosts default to https
+    /// (the API accepts the self-signed certificate when the toggle is on).
     pub fn normalized_base(&self) -> String {
         let b = self.base_url.trim().trim_end_matches('/');
         if b.starts_with("http://") || b.starts_with("https://") {
             b.to_string()
         } else {
             format!("https://{b}")
+        }
+    }
+
+    /// Base for opening the *web UI* in a browser. Unlike the API, a browser
+    /// has no "accept self-signed certificate" setting — https on a bare host
+    /// just throws a certificate warning — so this defaults to http unless
+    /// the user explicitly typed an https:// URL.
+    pub fn web_ui_base(&self) -> String {
+        let b = self.base_url.trim().trim_end_matches('/');
+        if b.starts_with("http://") || b.starts_with("https://") {
+            b.to_string()
+        } else {
+            format!("http://{b}")
         }
     }
 

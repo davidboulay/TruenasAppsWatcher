@@ -490,7 +490,7 @@ impl cosmic::Application for Window {
             }
             Message::OpenWebUi => {
                 if self.conn.is_configured() {
-                    let url = format!("{}/ui/apps/installed", self.conn.normalized_base());
+                    let url = format!("{}/ui/apps/installed", self.conn.web_ui_base());
                     self.spawn_with_token(&format!("xdg-open {url}"));
                 }
                 Task::none()

@@ -181,7 +181,7 @@ final class AppState: ObservableObject {
 
     func openTrueNAS() {
         guard trueNAS.isConfigured,
-              let url = URL(string: trueNAS.normalizedBase + "/ui/apps/installed")
+              let url = URL(string: trueNAS.webUIBase + "/ui/apps/installed")
         else { return }
         NSWorkspace.shared.open(url)
     }

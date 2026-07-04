@@ -15,12 +15,26 @@ struct TrueNASConnection: Equatable {
             && !apiKey.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
-    /// Base with a scheme and no trailing slash; bare hosts default to https.
+    /// Base with a scheme and no trailing slash; bare hosts default to https
+    /// (the API accepts the self-signed certificate when the toggle is on).
     var normalizedBase: String {
         var b = baseURL.trimmingCharacters(in: .whitespaces)
         while b.hasSuffix("/") { b.removeLast() }
         if !b.hasPrefix("http://") && !b.hasPrefix("https://") {
             b = "https://" + b
+        }
+        return b
+    }
+
+    /// Base for opening the *web UI* in a browser. Unlike the API, a browser
+    /// has no "accept self-signed certificate" setting — https on a bare host
+    /// just throws a certificate warning — so this defaults to http unless
+    /// the user explicitly typed an https:// URL.
+    var webUIBase: String {
+        var b = baseURL.trimmingCharacters(in: .whitespaces)
+        while b.hasSuffix("/") { b.removeLast() }
+        if !b.hasPrefix("http://") && !b.hasPrefix("https://") {
+            b = "http://" + b
         }
         return b
     }
