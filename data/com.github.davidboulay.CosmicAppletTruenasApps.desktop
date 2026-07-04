@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=TrueNAS Apps Watcher
+Comment=Watch a TrueNAS server and Portainer for pending Docker app updates and apply them
+Type=Application
+Exec=cosmic-applet-truenas-apps
+Terminal=false
+Categories=COSMIC;
+Keywords=COSMIC;Applet;TrueNAS;NAS;Docker;Apps;Updates;Upgrade;
+Icon=software-update-available-symbolic
+NoDisplay=true
+X-CosmicApplet=true
+X-CosmicShrinkable=true
+X-CosmicHoverPopup=Auto
+X-HostWaylandDisplay=true

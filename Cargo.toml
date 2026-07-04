@@ -1,0 +1,34 @@
+[package]
+name = "cosmic-applet-truenas-apps"
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-only"
+description = "TrueNAS Apps Watcher — a COSMIC panel applet that watches a TrueNAS server (and optionally Portainer) for pending Docker app updates and can apply them."
+
+[[bin]]
+name = "cosmic-applet-truenas-apps"
+path = "src/main.rs"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic", rev = "59bebbdffeb8ed4abd3f2577c099745b9a2f2c37", default-features = false, features = [
+    "applet",
+    "applet-token",
+    "process",
+    "multi-window",
+    "tokio",
+    "wayland",
+    "winit",
+] }
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+jiff = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+
+[profile.release]
+lto = "thin"
+opt-level = 2
