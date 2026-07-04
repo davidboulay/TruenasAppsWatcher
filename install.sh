@@ -14,8 +14,10 @@ msg() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 err() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; }
 
 latest_tag() {
-    curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-        | grep -o '"tag_name": *"[^"]*"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'
+    # The releases/latest web endpoint 302s to .../releases/tag/<tag>; unlike
+    # api.github.com it isn't subject to the anonymous API rate limit.
+    curl -fsI "https://github.com/$REPO/releases/latest" 2>/dev/null \
+        | tr -d '\r' | grep -i '^location:' | head -1 | sed 's|.*/tag/||; s|/$||'
 }
 
 install_macos() {

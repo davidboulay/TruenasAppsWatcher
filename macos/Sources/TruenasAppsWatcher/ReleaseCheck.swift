@@ -16,13 +16,18 @@ enum ReleaseCheck {
     }
 
     static func latest() async -> ReleaseStatus {
-        guard let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest") else {
+        // Uses the *web* endpoint, not api.github.com: releases/latest
+        // redirects to …/releases/tag/<tag>, and unlike the API it isn't
+        // subject to the 60-requests/hour anonymous quota that the whole
+        // LAN's public IP shares. URLSession follows the redirect; the tag
+        // is read off the final URL.
+        guard let url = URL(string: "https://github.com/\(repo)/releases/latest") else {
             return .error("bad URL")
         }
         var req = URLRequest(url: url)
-        req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        req.httpMethod = "HEAD"
         do {
-            let (data, response) = try await URLSession.shared.data(for: req)
+            let (_, response) = try await URLSession.shared.data(for: req)
             guard let http = response as? HTTPURLResponse else {
                 return .error("not an HTTP response")
             }
@@ -30,17 +35,17 @@ enum ReleaseCheck {
             if http.statusCode == 404 {
                 return .error("No release published yet")
             }
-            // 403/429: GitHub's anonymous API allows 60 requests/hour per IP.
-            if http.statusCode == 403 || http.statusCode == 429 {
-                return .error("GitHub rate limit reached — try again in an hour")
-            }
             guard (200..<300).contains(http.statusCode) else {
                 return .error("GitHub returned HTTP \(http.statusCode)")
             }
-            guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let tag = obj["tag_name"] as? String
-            else {
-                return .error("No release found")
+            let path = http.url?.path ?? ""
+            guard let range = path.range(of: "/tag/") else {
+                return .error("No release published yet")
+            }
+            let tag = String(path[range.upperBound...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            guard !tag.isEmpty else {
+                return .error("No release published yet")
             }
             return isNewer(tag, than: currentVersion) ? .available(tag) : .upToDate
         } catch {
