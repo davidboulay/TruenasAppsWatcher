@@ -20,9 +20,12 @@ pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Ask GitHub for the latest release tag (e.g. "v0.2.0" or "0.2.0").
 pub async fn latest_release() -> Result<String, String> {
     let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+    // No `-f`: a 404 (repo exists but no release published yet) should be
+    // reported as such, not as an unreachable GitHub. The 404 body is JSON
+    // without a `tag_name`, which parse_tag_name turns into "No release yet".
     let output = tokio::process::Command::new("curl")
         .args([
-            "-fsSL",
+            "-sSL",
             "-H",
             "Accept: application/vnd.github+json",
             "-A",
@@ -44,7 +47,7 @@ pub async fn latest_release() -> Result<String, String> {
     }
 
     let body = String::from_utf8_lossy(&output.stdout);
-    parse_tag_name(&body).ok_or_else(|| "No release found".to_string())
+    parse_tag_name(&body).ok_or_else(|| "No release published yet".to_string())
 }
 
 /// Extract the `tag_name` string from the releases JSON without a JSON parser.
