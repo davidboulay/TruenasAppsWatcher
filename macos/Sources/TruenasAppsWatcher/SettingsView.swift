@@ -89,6 +89,18 @@ struct SettingsView: View {
                 Text(ReleaseCheck.currentVersion).foregroundStyle(.secondary)
             }
             releaseRow
+
+            Divider()
+
+            // A menu-bar-only app has no Dock icon or app menu, and opening
+            // this window closes the popover (whose footer has the other
+            // Quit) — so it needs one here too.
+            Button(role: .destructive) {
+                NSApplication.shared.terminate(nil)
+            } label: {
+                Text("Quit TrueNAS Apps Watcher")
+                    .frame(maxWidth: .infinity)
+            }
         }
         .padding(20)
         .frame(width: 400)

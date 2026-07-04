@@ -30,7 +30,8 @@ jobs:
       - name: Build styled .dmg
         working-directory: macos
         run: |
-          pip3 install dmgbuild
+          # The runner's python is PEP 668 "externally managed".
+          pip3 install --break-system-packages dmgbuild
           ./scripts/make_dmg.sh
 
       - uses: actions/upload-artifact@v4
