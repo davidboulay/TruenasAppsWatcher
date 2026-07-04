@@ -149,6 +149,10 @@ pub struct AppsReport {
     /// Total number of installed apps, for the "all up to date" summary.
     pub total_apps: usize,
     pub errors: Vec<String>,
+    /// The query failed at the transport level (server or network down) —
+    /// automatic checks treat this as transient and retry quietly rather
+    /// than alarming (e.g. Wi-Fi not up yet right after login).
+    pub unreachable: bool,
 }
 
 impl AppsReport {
@@ -321,9 +325,11 @@ pub async fn check_apps(conn: Connection, refresh: bool) -> AppsReport {
             report
         }
         Err(e) => {
+            let unreachable = e.starts_with("Could not reach");
             errors.push(e);
             AppsReport {
                 errors,
+                unreachable,
                 ..AppsReport::default()
             }
         }

@@ -874,7 +874,7 @@ dependencies = [
 
 [[package]]
 name = "cosmic-applet-truenas-apps"
-version = "0.4.2"
+version = "0.4.3"
 dependencies = [
  "futures",
  "jiff",

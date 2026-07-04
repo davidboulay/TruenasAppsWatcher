@@ -104,7 +104,23 @@ pub struct Window {
     release: ReleaseStatus,
     /// True while a self-update download is in progress.
     self_updating: bool,
+    /// True when the in-flight check came from the "Check for updates"
+    /// button — its failures always show, unlike automatic checks.
+    last_check_manual: bool,
+    /// Whether any apps check has succeeded since launch.
+    ever_succeeded: bool,
+    /// Consecutive quiet retries after transient "server unreachable"
+    /// failures of automatic checks (e.g. Wi-Fi not up yet after login).
+    silent_retries: u32,
+    silent_container_retries: u32,
+    /// A persistent connectivity error worth showing (manual check failed,
+    /// or the quiet retries ran out).
+    check_error: Option<String>,
 }
+
+/// Quiet 20-second retries before an unreachable server is reported —
+/// roughly five minutes of grace after login.
+const MAX_SILENT_RETRIES: u32 = 15;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -312,6 +328,11 @@ impl cosmic::Application for Window {
             show_settings: false,
             release: ReleaseStatus::Unknown,
             self_updating: false,
+            last_check_manual: false,
+            ever_succeeded: false,
+            silent_retries: 0,
+            silent_container_retries: 0,
+            check_error: None,
         };
         window.show_settings = !window.conn.is_configured();
         // Populate counts on startup (plain query, no catalog sync), and learn
@@ -433,13 +454,38 @@ impl cosmic::Application for Window {
                 }
                 Task::none()
             }
-            Message::Check { refresh } => self.run_check(refresh),
-            Message::CheckContainers => self.run_container_check(),
+            Message::Check { refresh } => {
+                self.last_check_manual = false;
+                self.run_check(refresh)
+            }
+            Message::CheckContainers => {
+                self.last_check_manual = false;
+                self.run_container_check()
+            }
             Message::CheckAll => {
+                self.last_check_manual = true;
                 Task::batch([self.run_check(true), self.run_container_check()])
             }
             Message::Checked(report) => {
                 self.checking = false;
+                if report.unreachable {
+                    // Keep whatever we last knew instead of clobbering it.
+                    // Automatic checks retry quietly first — right after
+                    // login the network is often not up yet, and a red
+                    // "no internet" flash helps nobody.
+                    if !self.last_check_manual && self.silent_retries < MAX_SILENT_RETRIES {
+                        self.silent_retries += 1;
+                        return cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_secs(20)).await;
+                            cosmic::Action::App(Message::Check { refresh: false })
+                        });
+                    }
+                    self.check_error = report.errors.first().cloned();
+                    return Task::none();
+                }
+                self.ever_succeeded = true;
+                self.silent_retries = 0;
+                self.check_error = None;
                 self.report = report;
                 self.last_checked = Some(
                     jiff::Zoned::now()
@@ -450,6 +496,21 @@ impl cosmic::Application for Window {
             }
             Message::ContainersChecked(report) => {
                 self.checking_containers = false;
+                if report.unreachable {
+                    if !self.last_check_manual
+                        && self.silent_container_retries < MAX_SILENT_RETRIES
+                    {
+                        self.silent_container_retries += 1;
+                        return cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_secs(20)).await;
+                            cosmic::Action::App(Message::CheckContainers)
+                        });
+                    }
+                    // Persistent or manual: show it with the report errors.
+                    self.containers.errors = report.errors;
+                    return Task::none();
+                }
+                self.silent_container_retries = 0;
                 self.containers = report;
                 Task::none()
             }
@@ -572,6 +633,10 @@ impl cosmic::Application for Window {
                 // error captions on the main view show the outcome.
                 self.report = AppsReport::default();
                 self.containers = ContainerReport::default();
+                self.ever_succeeded = false;
+                self.silent_retries = 0;
+                self.silent_container_retries = 0;
+                self.check_error = None;
                 self.show_settings = false;
                 Task::batch([self.run_check(false), self.run_container_check()])
             }
@@ -639,7 +704,10 @@ impl cosmic::Application for Window {
                     tracing::info!(
                         "self-update installed; exiting so the panel respawns the new version"
                     );
-                    std::process::exit(0);
+                    // Non-zero on purpose: cosmic-panel respawns applets that
+                    // die abnormally but treats a clean exit 0 as an
+                    // intentional quit and leaves the slot dead.
+                    std::process::exit(1);
                 }
                 // Standalone (e.g. launched from a terminal): exec in place.
                 // This only returns if the exec itself fails.
@@ -738,6 +806,10 @@ impl cosmic::Application for Window {
         // Header / summary line.
         let summary = if !self.conn.is_configured() {
             text::body("Not connected to a TrueNAS server")
+        } else if !self.ever_succeeded && self.check_error.is_none() {
+            // First contact after launch hasn't landed yet (quiet retries
+            // may be running while the network comes up) — stay neutral.
+            text::body("Connecting to TrueNAS…")
         } else if self.checking || self.checking_containers {
             text::body("Checking for updates…")
         } else if total == 0 {
@@ -805,6 +877,9 @@ impl cosmic::Application for Window {
         // Errors, if any.
         let mut error_lines: Vec<String> = self.report.errors.clone();
         error_lines.extend(self.containers.errors.iter().cloned());
+        if let Some(e) = &self.check_error {
+            error_lines.push(e.clone());
+        }
         if let Some(e) = &self.install_error {
             error_lines.push(e.clone());
         }

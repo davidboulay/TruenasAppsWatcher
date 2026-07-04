@@ -99,6 +99,10 @@ struct AppsReport: Equatable {
     var images: [UpdateItem] = []
     var totalApps = 0
     var errors: [String] = []
+    /// The query failed at the transport level (server or network down) —
+    /// automatic checks treat this as transient and retry quietly rather
+    /// than alarming (e.g. Wi-Fi not up yet right after login).
+    var unreachable = false
 
     var total: Int { upgrades.count + images.count }
 }
@@ -108,6 +112,8 @@ struct ContainerReport: Equatable {
     var updates: [UpdateItem] = []
     var totalContainers = 0
     var errors: [String] = []
+    /// Portainer wasn't reachable at all — see `AppsReport.unreachable`.
+    var unreachable = false
 }
 
 /// Where the app's own version sits relative to the latest GitHub release.

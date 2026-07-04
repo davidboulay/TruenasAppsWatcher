@@ -100,6 +100,8 @@ struct TrueNASClient {
             report.upgrades.sort { $0.title.lowercased() < $1.title.lowercased() }
             report.images.sort { $0.title.lowercased() < $1.title.lowercased() }
         } catch {
+            // URLError = transport-level (offline, refused, DNS, timeout).
+            report.unreachable = error is URLError
             report.errors.append(error.localizedDescription)
         }
         return report

@@ -91,6 +91,9 @@ pub struct ContainerReport {
     /// How many (non-TrueNAS) running containers were examined.
     pub total_containers: usize,
     pub errors: Vec<String>,
+    /// Portainer wasn't reachable at all — treated as transient by
+    /// automatic checks (see [`crate::backend::AppsReport::unreachable`]).
+    pub unreachable: bool,
 }
 
 #[derive(Deserialize)]
@@ -148,6 +151,7 @@ pub async fn check_containers(conn: PortainerConnection) -> ContainerReport {
     {
         Ok(e) => e,
         Err(e) => {
+            report.unreachable = e.starts_with("Could not reach");
             report.errors.push(e);
             return report;
         }

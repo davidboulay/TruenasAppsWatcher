@@ -90,6 +90,8 @@ struct PortainerClient {
                 session, request("GET", "/api/endpoints?limit=100"), label: "Portainer endpoints")
             endpoints = try JSONDecoder().decode([Endpoint].self, from: data)
         } catch {
+            // URLError = transport-level (offline, refused, DNS, timeout).
+            report.unreachable = error is URLError
             report.errors.append(error.localizedDescription)
             return report
         }

@@ -171,6 +171,7 @@ struct PopoverView: View {
     @ViewBuilder
     private var errorLines: some View {
         let lines = state.report.errors + state.containers.errors
+            + (state.checkError.map { [$0] } ?? [])
             + (state.installError.map { [$0] } ?? [])
         ForEach(lines, id: \.self) { line in
             Text(line)

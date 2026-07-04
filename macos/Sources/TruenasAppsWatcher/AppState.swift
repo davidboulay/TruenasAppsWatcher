@@ -17,6 +17,19 @@ final class AppState: ObservableObject {
     @Published var checking = false
     @Published var checkingContainers = false
     @Published var lastChecked: String?
+    /// A persistent connectivity error worth showing (manual check failed,
+    /// or the quiet retries ran out).
+    @Published var checkError: String?
+    /// Whether any apps check has succeeded since launch.
+    @Published var everSucceeded = false
+
+    /// Consecutive quiet retries after transient "server unreachable"
+    /// failures of automatic checks (e.g. Wi-Fi not up yet after login).
+    private var silentRetries = 0
+    private var silentContainerRetries = 0
+    /// Quiet 20-second retries before an unreachable server is reported —
+    /// roughly five minutes of grace after login.
+    private let maxSilentRetries = 15
 
     // MARK: Applying updates
 
@@ -44,6 +57,11 @@ final class AppState: ObservableObject {
     var summary: String {
         if !trueNAS.isConfigured {
             return "Not connected to a TrueNAS server"
+        }
+        if !everSucceeded && checkError == nil {
+            // First contact after launch hasn't landed yet (quiet retries
+            // may be running while the network comes up) — stay neutral.
+            return "Connecting to TrueNAS…"
         }
         if checking || checkingContainers {
             return "Checking for updates…"
@@ -90,34 +108,63 @@ final class AppState: ObservableObject {
 
     // MARK: Actions
 
-    func checkApps(refreshCatalog: Bool = false) {
+    func checkApps(refreshCatalog: Bool = false, manual: Bool = false) {
         guard !checking, trueNAS.isConfigured else { return }
         checking = true
         let client = TrueNASClient(trueNAS)
         Task {
             let result = await client.checkApps(refreshCatalog: refreshCatalog)
-            self.report = result
             self.checking = false
+            if result.unreachable {
+                // Keep whatever we last knew instead of clobbering it.
+                // Automatic checks retry quietly first — right after login
+                // the network is often not up yet, and a red "no internet"
+                // flash helps nobody.
+                if !manual, self.silentRetries < self.maxSilentRetries {
+                    self.silentRetries += 1
+                    try? await Task.sleep(nanoseconds: 20_000_000_000)
+                    self.checkApps()
+                } else {
+                    self.checkError = result.errors.first
+                }
+                return
+            }
+            self.everSucceeded = true
+            self.silentRetries = 0
+            self.checkError = nil
+            self.report = result
             let fmt = DateFormatter()
             fmt.dateFormat = "HH:mm"
             self.lastChecked = fmt.string(from: Date())
         }
     }
 
-    func checkContainers() {
+    func checkContainers(manual: Bool = false) {
         guard !checkingContainers, portainer.isConfigured else { return }
         checkingContainers = true
         let client = PortainerClient(portainer)
         Task {
             let result = await client.checkContainers()
-            self.containers = result
             self.checkingContainers = false
+            if result.unreachable {
+                if !manual, self.silentContainerRetries < self.maxSilentRetries {
+                    self.silentContainerRetries += 1
+                    try? await Task.sleep(nanoseconds: 20_000_000_000)
+                    self.checkContainers()
+                } else {
+                    // Persistent or manual: show it with the report errors.
+                    self.containers.errors = result.errors
+                }
+                return
+            }
+            self.silentContainerRetries = 0
+            self.containers = result
         }
     }
 
     func checkAll() {
-        checkApps(refreshCatalog: true)
-        checkContainers()
+        checkApps(refreshCatalog: true, manual: true)
+        checkContainers(manual: true)
     }
 
     /// Apply every pending update, one at a time, streaming overall progress.
@@ -209,6 +256,10 @@ final class AppState: ObservableObject {
 
         report = AppsReport()
         containers = ContainerReport()
+        everSucceeded = false
+        silentRetries = 0
+        silentContainerRetries = 0
+        checkError = nil
         checkApps()
         checkContainers()
     }
