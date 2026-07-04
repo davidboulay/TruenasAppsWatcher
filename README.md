@@ -9,8 +9,7 @@ for the [**COSMIC**](https://system76.com/cosmic/) desktop on Linux and a
 | Linux (COSMIC) | macOS |
 |:---|:---|
 | Panel applet for Pop!_OS and the COSMIC spins/packages of Fedora, Arch, NixOS, openSUSE, … (`cosmic/`) | Menu bar app, **no Dock icon**, for macOS 13+ on Apple Silicon or Intel (`macos/`) |
-
-<img src="screenshots/popup.png" width="420" alt="Applet popup showing all apps and containers up to date">
+| <img src="screenshots/popup.png" width="400" alt="COSMIC applet popup showing all apps and containers up to date"> | <img src="screenshots/macos-popup.png" width="440" alt="macOS menu bar popover showing all apps and containers up to date"> |
 
 ## What it does
 
