@@ -47,7 +47,15 @@ pub async fn latest_release() -> Result<String, String> {
     }
 
     let body = String::from_utf8_lossy(&output.stdout);
-    parse_tag_name(&body).ok_or_else(|| "No release published yet".to_string())
+    parse_tag_name(&body).ok_or_else(|| {
+        // GitHub's anonymous API allows 60 requests/hour per IP; the refusal
+        // body has no tag_name and would otherwise read as "no release".
+        if body.contains("rate limit") {
+            "GitHub rate limit reached — try again in an hour".to_string()
+        } else {
+            "No release published yet".to_string()
+        }
+    })
 }
 
 /// Extract the `tag_name` string from the releases JSON without a JSON parser.

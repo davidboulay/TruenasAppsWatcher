@@ -30,6 +30,10 @@ enum ReleaseCheck {
             if http.statusCode == 404 {
                 return .error("No release published yet")
             }
+            // 403/429: GitHub's anonymous API allows 60 requests/hour per IP.
+            if http.statusCode == 403 || http.statusCode == 429 {
+                return .error("GitHub rate limit reached — try again in an hour")
+            }
             guard (200..<300).contains(http.statusCode) else {
                 return .error("GitHub returned HTTP \(http.statusCode)")
             }
