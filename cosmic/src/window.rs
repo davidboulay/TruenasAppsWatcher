@@ -44,6 +44,10 @@ const PORTAINER_URL_KEY: &str = "portainer-url";
 const PORTAINER_API_KEY_KEY: &str = "portainer-api-key";
 /// Config key for the "automatically update the applet" toggle.
 const AUTO_UPDATE_KEY: &str = "auto-update";
+/// The release tag we last auto-installed. Prevents an endless update loop when
+/// a release is mis-versioned (its binary reports an older version than its tag,
+/// so it always looks "newer"): we only auto-apply a given tag once.
+const LAST_AUTO_UPDATE_KEY: &str = "last-auto-update";
 
 /// Where the applet's own version sits relative to the latest GitHub release.
 #[derive(Debug, Clone)]
@@ -117,6 +121,9 @@ pub struct Window {
     /// down…). A normal state for a laptop — shown as a neutral banner, not
     /// an error, while background retries continue.
     offline: bool,
+    /// The release tag we've already auto-installed (persisted), so a
+    /// mis-versioned release can't loop us into re-applying it forever.
+    last_auto_update: Option<String>,
 }
 
 /// Quiet 20-second retries before an unreachable server is reported —
@@ -163,8 +170,8 @@ pub enum Message {
     SetAutoUpdate(bool),
     /// Download and install the given release tag of the applet, then relaunch.
     SelfUpdate(String),
-    /// Ok carries the path of the replaced binary to relaunch.
-    SelfUpdated(Result<std::path::PathBuf, String>),
+    /// Carries the tag that was installed and the path of the replaced binary.
+    SelfUpdated(String, Result<std::path::PathBuf, String>),
     Token(TokenUpdate),
 }
 
@@ -208,7 +215,8 @@ impl Window {
     /// Download and install the given release tag in the background.
     fn do_self_update(tag: String) -> app::Task<Message> {
         cosmic::task::future(async move {
-            cosmic::Action::App(Message::SelfUpdated(updater::self_update(&tag).await))
+            let result = updater::self_update(&tag).await;
+            cosmic::Action::App(Message::SelfUpdated(tag, result))
         })
     }
 
@@ -300,6 +308,9 @@ impl cosmic::Application for Window {
             .as_ref()
             .and_then(|c| c.get::<bool>(AUTO_UPDATE_KEY).ok())
             .unwrap_or(false);
+        let last_auto_update = config
+            .as_ref()
+            .and_then(|c| c.get::<String>(LAST_AUTO_UPDATE_KEY).ok());
 
         let mut window = Self {
             core,
@@ -334,6 +345,7 @@ impl cosmic::Application for Window {
             silent_retries: 0,
             silent_container_retries: 0,
             offline: false,
+            last_auto_update,
         };
         window.show_settings = !window.conn.is_configured();
         // Populate counts on startup (plain query, no catalog sync), and learn
@@ -661,10 +673,24 @@ impl cosmic::Application for Window {
             Message::ReleaseChecked(Ok(tag)) => {
                 if updater::is_newer(&tag, updater::CURRENT_VERSION) {
                     self.release = ReleaseStatus::Available(tag.clone());
-                    // Auto-install the new version if the user opted in.
-                    if self.auto_update && !self.self_updating {
+                    // Auto-install the new version if the user opted in — but
+                    // only once per tag. If we already auto-applied this exact
+                    // tag and it still looks newer, the release is mis-versioned
+                    // (its binary reports an older version than its tag); applying
+                    // again would loop forever, so we stop and leave it shown as
+                    // available for a manual decision.
+                    let already_applied =
+                        self.last_auto_update.as_deref() == Some(tag.as_str());
+                    if self.auto_update && !self.self_updating && !already_applied {
                         self.self_updating = true;
                         return Self::do_self_update(tag);
+                    }
+                    if already_applied {
+                        tracing::warn!(
+                            "release {tag} still reports newer than {} after updating \
+                             — skipping auto-update to avoid a loop (mis-versioned release?)",
+                            updater::CURRENT_VERSION
+                        );
                     }
                 } else {
                     self.release = ReleaseStatus::UpToDate;
@@ -700,7 +726,16 @@ impl cosmic::Application for Window {
                 self.self_updating = true;
                 Self::do_self_update(tag)
             }
-            Message::SelfUpdated(Ok(exe)) => {
+            Message::SelfUpdated(tag, Ok(exe)) => {
+                // Record the tag we just installed so that if the new binary
+                // still reports an older version (mis-versioned release), the
+                // next check won't re-apply it and loop.
+                self.last_auto_update = Some(tag.clone());
+                if let Some(cfg) = &self.config
+                    && let Err(e) = cfg.set(LAST_AUTO_UPDATE_KEY, tag)
+                {
+                    tracing::warn!("could not persist last-auto-update tag: {e}");
+                }
                 // The binary has been replaced — now run the new version.
                 //
                 // Under cosmic-panel, exec-ing ourselves can't re-attach to
@@ -729,7 +764,7 @@ impl cosmic::Application for Window {
                     ReleaseStatus::Error(format!("Updated, but relaunch failed: {err}"));
                 Task::none()
             }
-            Message::SelfUpdated(Err(e)) => {
+            Message::SelfUpdated(_, Err(e)) => {
                 self.self_updating = false;
                 self.release = ReleaseStatus::Error(e);
                 Task::none()
