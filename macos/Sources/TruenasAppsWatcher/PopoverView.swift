@@ -64,6 +64,16 @@ struct PopoverView: View {
             .disabled(state.checking || state.checkingContainers || state.installing
                       || !state.trueNAS.isConfigured)
 
+            if state.offline {
+                // Off the home network (or the NAS is down) — a normal
+                // state, not an error. Background retries keep running.
+                Label(
+                    "TrueNAS not reachable — retrying automatically",
+                    systemImage: "wifi.slash")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
             errorLines
 
             if state.totalUpdates > 0 {
@@ -100,6 +110,9 @@ struct PopoverView: View {
                         .frame(maxWidth: .infinity)
                     }
                     .keyboardShortcut(.defaultAction)
+                    // Stale list while unreachable: applying would just
+                    // time out item by item.
+                    .disabled(state.offline)
                 }
             }
 
@@ -171,7 +184,6 @@ struct PopoverView: View {
     @ViewBuilder
     private var errorLines: some View {
         let lines = state.report.errors + state.containers.errors
-            + (state.checkError.map { [$0] } ?? [])
             + (state.installError.map { [$0] } ?? [])
         ForEach(lines, id: \.self) { line in
             Text(line)

@@ -17,9 +17,10 @@ final class AppState: ObservableObject {
     @Published var checking = false
     @Published var checkingContainers = false
     @Published var lastChecked: String?
-    /// A persistent connectivity error worth showing (manual check failed,
-    /// or the quiet retries ran out).
-    @Published var checkError: String?
+    /// The server is persistently unreachable (off the home network, NAS
+    /// down…). A normal state for a laptop — shown as a neutral banner, not
+    /// an error, while background retries continue.
+    @Published var offline = false
     /// Whether any apps check has succeeded since launch.
     @Published var everSucceeded = false
 
@@ -58,10 +59,13 @@ final class AppState: ObservableObject {
         if !trueNAS.isConfigured {
             return "Not connected to a TrueNAS server"
         }
-        if !everSucceeded && checkError == nil {
+        if !everSucceeded && !offline {
             // First contact after launch hasn't landed yet (quiet retries
             // may be running while the network comes up) — stay neutral.
             return "Connecting to TrueNAS…"
+        }
+        if offline && totalUpdates == 0 && report.totalApps == 0 {
+            return "TrueNAS not reachable"
         }
         if checking || checkingContainers {
             return "Checking for updates…"
@@ -119,19 +123,25 @@ final class AppState: ObservableObject {
                 // Keep whatever we last knew instead of clobbering it.
                 // Automatic checks retry quietly first — right after login
                 // the network is often not up yet, and a red "no internet"
-                // flash helps nobody.
+                // flash helps nobody. Once the retries run out this is the
+                // off-the-home-network case: flag it (neutral banner) and
+                // keep retrying at a slower pace so it recovers by itself.
                 if !manual, self.silentRetries < self.maxSilentRetries {
                     self.silentRetries += 1
                     try? await Task.sleep(nanoseconds: 20_000_000_000)
                     self.checkApps()
                 } else {
-                    self.checkError = result.errors.first
+                    self.offline = true
+                    if !manual {
+                        try? await Task.sleep(nanoseconds: 120_000_000_000)
+                        self.checkApps()
+                    }
                 }
                 return
             }
             self.everSucceeded = true
             self.silentRetries = 0
-            self.checkError = nil
+            self.offline = false
             self.report = result
             let fmt = DateFormatter()
             fmt.dateFormat = "HH:mm"
@@ -152,8 +162,9 @@ final class AppState: ObservableObject {
                     try? await Task.sleep(nanoseconds: 20_000_000_000)
                     self.checkContainers()
                 } else {
-                    // Persistent or manual: show it with the report errors.
-                    self.containers.errors = result.errors
+                    // Rides the shared "not reachable" banner rather than
+                    // duplicating a second timeout line in red.
+                    self.offline = true
                 }
                 return
             }
@@ -169,7 +180,9 @@ final class AppState: ObservableObject {
 
     /// Apply every pending update, one at a time, streaming overall progress.
     func applyAll() {
-        guard !installing, !checking, totalUpdates > 0 else { return }
+        // `offline`: the pending list is stale data from the last successful
+        // check — starting jobs now would just time out item by item.
+        guard !installing, !checking, !offline, totalUpdates > 0 else { return }
         installing = true
         installProgress = nil
         installError = nil
@@ -259,7 +272,7 @@ final class AppState: ObservableObject {
         everSucceeded = false
         silentRetries = 0
         silentContainerRetries = 0
-        checkError = nil
+        offline = false
         checkApps()
         checkContainers()
     }

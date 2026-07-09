@@ -113,9 +113,10 @@ pub struct Window {
     /// failures of automatic checks (e.g. Wi-Fi not up yet after login).
     silent_retries: u32,
     silent_container_retries: u32,
-    /// A persistent connectivity error worth showing (manual check failed,
-    /// or the quiet retries ran out).
-    check_error: Option<String>,
+    /// The server is persistently unreachable (off the home network, NAS
+    /// down…). A normal state for a laptop — shown as a neutral banner, not
+    /// an error, while background retries continue.
+    offline: bool,
 }
 
 /// Quiet 20-second retries before an unreachable server is reported —
@@ -332,7 +333,7 @@ impl cosmic::Application for Window {
             ever_succeeded: false,
             silent_retries: 0,
             silent_container_retries: 0,
-            check_error: None,
+            offline: false,
         };
         window.show_settings = !window.conn.is_configured();
         // Populate counts on startup (plain query, no catalog sync), and learn
@@ -472,7 +473,10 @@ impl cosmic::Application for Window {
                     // Keep whatever we last knew instead of clobbering it.
                     // Automatic checks retry quietly first — right after
                     // login the network is often not up yet, and a red
-                    // "no internet" flash helps nobody.
+                    // "no internet" flash helps nobody. Once the retries run
+                    // out this is the off-the-home-network case: flag it
+                    // (neutral banner) and keep retrying at a slower pace so
+                    // it recovers by itself.
                     if !self.last_check_manual && self.silent_retries < MAX_SILENT_RETRIES {
                         self.silent_retries += 1;
                         return cosmic::task::future(async move {
@@ -480,12 +484,18 @@ impl cosmic::Application for Window {
                             cosmic::Action::App(Message::Check { refresh: false })
                         });
                     }
-                    self.check_error = report.errors.first().cloned();
+                    self.offline = true;
+                    if !self.last_check_manual {
+                        return cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_secs(120)).await;
+                            cosmic::Action::App(Message::Check { refresh: false })
+                        });
+                    }
                     return Task::none();
                 }
                 self.ever_succeeded = true;
                 self.silent_retries = 0;
-                self.check_error = None;
+                self.offline = false;
                 self.report = report;
                 self.last_checked = Some(
                     jiff::Zoned::now()
@@ -506,8 +516,9 @@ impl cosmic::Application for Window {
                             cosmic::Action::App(Message::CheckContainers)
                         });
                     }
-                    // Persistent or manual: show it with the report errors.
-                    self.containers.errors = report.errors;
+                    // Rides the shared "not reachable" banner rather than
+                    // duplicating a second timeout line in red.
+                    self.offline = true;
                     return Task::none();
                 }
                 self.silent_container_retries = 0;
@@ -515,7 +526,7 @@ impl cosmic::Application for Window {
                 Task::none()
             }
             Message::Install => {
-                if self.installing || self.checking || self.total_updates() == 0 {
+                if self.installing || self.checking || self.offline || self.total_updates() == 0 {
                     return Task::none();
                 }
                 self.installing = true;
@@ -636,7 +647,7 @@ impl cosmic::Application for Window {
                 self.ever_succeeded = false;
                 self.silent_retries = 0;
                 self.silent_container_retries = 0;
-                self.check_error = None;
+                self.offline = false;
                 self.show_settings = false;
                 Task::batch([self.run_check(false), self.run_container_check()])
             }
@@ -806,10 +817,12 @@ impl cosmic::Application for Window {
         // Header / summary line.
         let summary = if !self.conn.is_configured() {
             text::body("Not connected to a TrueNAS server")
-        } else if !self.ever_succeeded && self.check_error.is_none() {
+        } else if !self.ever_succeeded && !self.offline {
             // First contact after launch hasn't landed yet (quiet retries
             // may be running while the network comes up) — stay neutral.
             text::body("Connecting to TrueNAS…")
+        } else if self.offline && total == 0 && self.report.total_apps == 0 {
+            text::body("TrueNAS not reachable")
         } else if self.checking || self.checking_containers {
             text::body("Checking for updates…")
         } else if total == 0 {
@@ -874,12 +887,20 @@ impl cosmic::Application for Window {
             .width(Length::Fill);
         content = content.push(padded_control(check_button));
 
+        // Off the home network (or the NAS is down) — a normal state, not
+        // an error. Background retries keep running.
+        if self.offline {
+            content = content.push(
+                padded_control(text::caption(
+                    "TrueNAS not reachable — retrying automatically",
+                ))
+                .padding([space_xxs, space_m]),
+            );
+        }
+
         // Errors, if any.
         let mut error_lines: Vec<String> = self.report.errors.clone();
         error_lines.extend(self.containers.errors.iter().cloned());
-        if let Some(e) = &self.check_error {
-            error_lines.push(e.clone());
-        }
         if let Some(e) = &self.install_error {
             error_lines.push(e.clone());
         }
@@ -936,7 +957,9 @@ impl cosmic::Application for Window {
                     column![text::body(label), bar].spacing(space_xxs),
                 ));
             } else {
-                // Primary action: apply everything on the server.
+                // Primary action: apply everything on the server. Disabled
+                // while unreachable — the list is stale data from the last
+                // successful check and the jobs would just time out.
                 let install_button = button::suggested(format!(
                     "Apply {total} update{}",
                     if total == 1 { "" } else { "s" }
@@ -944,7 +967,7 @@ impl cosmic::Application for Window {
                 .leading_icon(
                     icon::from_name("system-software-install-symbolic").symbolic(true),
                 )
-                .on_press(Message::Install)
+                .on_press_maybe((!self.offline).then_some(Message::Install))
                 .width(Length::Fill);
                 content = content.push(padded_control(install_button));
             }
