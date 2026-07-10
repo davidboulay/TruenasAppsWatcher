@@ -449,6 +449,10 @@ impl cosmic::Application for Window {
                 if let Some(p) = self.popup.take() {
                     destroy_popup(p)
                 } else {
+                    // Always reopen on the main view, not wherever the popup
+                    // was left (e.g. the settings panel) — except while
+                    // unconfigured, where settings is the only useful view.
+                    self.show_settings = !self.conn.is_configured();
                     let new_id = window::Id::unique();
                     self.popup = Some(new_id);
                     let popup_settings = self.core.applet.get_popup_settings(
@@ -464,6 +468,9 @@ impl cosmic::Application for Window {
             Message::CloseRequested(id) => {
                 if Some(id) == self.popup {
                     self.popup = None;
+                    // Same reset as on open, so a click-away close doesn't
+                    // leave the settings panel armed for next time.
+                    self.show_settings = !self.conn.is_configured();
                 }
                 Task::none()
             }
