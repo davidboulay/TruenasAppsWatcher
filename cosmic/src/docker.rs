@@ -104,6 +104,14 @@ struct Endpoint {
     kind: i64,
 }
 
+#[derive(Deserialize, Default)]
+struct ApiHostConfig {
+    /// For a container sharing another's network namespace this is the literal
+    /// `container:<id>` — which is why recreating the carrier breaks it.
+    #[serde(rename = "NetworkMode", default)]
+    network_mode: String,
+}
+
 #[derive(Deserialize)]
 struct ApiContainer {
     #[serde(rename = "Id")]
@@ -116,6 +124,14 @@ struct ApiContainer {
     image_id: String,
     #[serde(rename = "Labels", default)]
     labels: HashMap<String, String>,
+    /// "running", "exited", … Current Docker always sends it; `Status` ("Up 3
+    /// days") is the older spelling and is used as a fallback.
+    #[serde(rename = "State", default)]
+    state: String,
+    #[serde(rename = "Status", default)]
+    status: String,
+    #[serde(rename = "HostConfig", default)]
+    host_config: ApiHostConfig,
 }
 
 impl ApiContainer {
@@ -134,6 +150,130 @@ impl ApiContainer {
             .get("com.docker.compose.project")
             .is_some_and(|p| p.starts_with("ix-"))
     }
+
+    /// Only a running container is a candidate for an update. The list is
+    /// fetched with `?all=1` so stopped *dependents* are visible to the checks
+    /// below; without this filter that same flag would make the applet offer to
+    /// recreate — and thereby start — containers deliberately stopped.
+    ///
+    /// A list carrying neither field is treated as running: that is what it
+    /// meant before `?all=1`, and updating nothing at all is a worse failure
+    /// than the one this guards against.
+    fn is_running(&self) -> bool {
+        if !self.state.is_empty() {
+            return self.state == "running";
+        }
+        if !self.status.is_empty() {
+            return self.status.starts_with("Up");
+        }
+        true
+    }
+
+    fn label(&self, name: &str) -> &str {
+        self.labels.get(name).map(String::as_str).unwrap_or_default()
+    }
+
+    fn compose_project(&self) -> &str {
+        self.label("com.docker.compose.project")
+    }
+
+    fn compose_service(&self) -> &str {
+        self.label("com.docker.compose.service")
+    }
+
+    /// Where the stack's compose file lives, so a refusal can say where to go.
+    fn stack_working_dir(&self) -> &str {
+        self.label("com.docker.compose.project.working_dir")
+    }
+}
+
+/// `com.docker.compose.depends_on` is a comma-separated list of
+/// `<service>:<condition>:<restart>` entries, e.g.
+/// "gluetun:service_healthy:false".
+fn parse_depends_on(value: &str) -> Vec<&str> {
+    value
+        .split(',')
+        .filter_map(|entry| {
+            let name = entry.split(':').next().unwrap_or_default().trim();
+            (!name.is_empty()).then_some(name)
+        })
+        .collect()
+}
+
+/// Containers riding this one's network namespace — the fatal case.
+///
+/// compose's `network_mode: "service:x"` is stored by Docker per container as a
+/// literal `HostConfig.NetworkMode = "container:<x-id>"`. Recreating x gives it
+/// a *new* id, so the passenger's namespace target stops existing: it cannot
+/// start ("No such container"), and one that was already running can keep
+/// reporting healthy with no network at all, which is worse because nothing
+/// alarms.
+fn network_passengers(target: &ApiContainer, all: &[ApiContainer]) -> Vec<String> {
+    let needle = format!("container:{}", target.id);
+    all.iter()
+        .filter(|c| c.id != target.id && c.host_config.network_mode == needle)
+        .map(ApiContainer::display_name)
+        .collect()
+}
+
+/// Containers in the same stack that declared a compose dependency on this
+/// one's service.
+fn compose_dependants(target: &ApiContainer, all: &[ApiContainer]) -> Vec<String> {
+    let (project, service) = (target.compose_project(), target.compose_service());
+    if project.is_empty() || service.is_empty() {
+        return Vec::new();
+    }
+    all.iter()
+        .filter(|c| c.id != target.id && c.compose_project() == project)
+        .filter(|c| parse_depends_on(c.label("com.docker.compose.depends_on")).contains(&service))
+        .map(ApiContainer::display_name)
+        .collect()
+}
+
+/// Why this container must not be recreated on its own, if it must not be.
+///
+/// Portainer's recreate is per container: it renames the old one aside, creates
+/// a replacement with a new id, and destroys the original. Safe for a
+/// standalone container, destructive for one anything else is attached to.
+/// Both signals come out of the container list already fetched, so this costs
+/// no extra request.
+///
+/// Refusing is the complete fix rather than half of one. Portainer's recreate
+/// reuses the container's existing config, which still names the dead namespace
+/// id, so recreating the dependents afterwards reproduces the breakage, and
+/// `docker restart` fails too. Only `docker compose up -d` re-resolves
+/// `service:x` to the new id, and this applet has no shell on the NAS.
+fn dependency_block(target: &ApiContainer, all: &[ApiContainer]) -> Option<String> {
+    let mut names = network_passengers(target, all);
+    for name in compose_dependants(target, all) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return None;
+    }
+    names.sort();
+    let shown = if names.len() > 3 {
+        format!("{}, +{} more", names[..3].join(", "), names.len() - 3)
+    } else {
+        names.join(", ")
+    };
+    let plural = if names.len() == 1 { "" } else { "s" };
+    let verb = if names.len() == 1 { "s" } else { "" };
+    let object = if names.len() == 1 { "it" } else { "them" };
+    let head = format!(
+        "{} container{plural} depend{verb} on {} ({shown}). \
+         Recreating it alone would give it a new id and break {object}.",
+        names.len(),
+        target.display_name()
+    );
+    let dir = target.stack_working_dir();
+    Some(if dir.is_empty() {
+        format!("{head} Update the whole stack instead (docker compose up -d).")
+    } else {
+        format!("{head} Update the stack instead: {dir}")
+    })
 }
 
 /// Check all Docker environments known to Portainer for containers whose
@@ -171,8 +311,13 @@ pub async fn check_containers(conn: PortainerConnection) -> ContainerReport {
 
     // Types 1 and 2 are Docker environments (local socket / agent).
     for ep in endpoints.iter().filter(|e| e.kind == 1 || e.kind == 2) {
+        // `?all=1`: a *stopped* dependent is the one most at risk, since it
+        // cannot be restarted once the container it rides has a new id.
         let containers: Vec<ApiContainer> = match conn
-            .get(&format!("/api/endpoints/{}/docker/containers/json", ep.id))
+            .get(&format!(
+                "/api/endpoints/{}/docker/containers/json?all=1",
+                ep.id
+            ))
             .await
             .and_then(|v| serde_json::from_value(v).map_err(|e| format!("containers: {e}")))
         {
@@ -183,12 +328,15 @@ pub async fn check_containers(conn: PortainerConnection) -> ContainerReport {
             }
         };
 
-        for c in containers {
+        for c in &containers {
             if c.is_truenas_managed() {
                 continue;
             }
             // Images pinned by digest or referenced by raw id can't drift.
             if c.image.contains('@') || c.image.starts_with("sha256:") || c.image.is_empty() {
+                continue;
+            }
+            if !c.is_running() {
                 continue;
             }
             report.total_containers += 1;
@@ -226,6 +374,9 @@ pub async fn check_containers(conn: PortainerConnection) -> ContainerReport {
                             container_id: c.id.clone(),
                             image: c.image.clone(),
                         },
+                        // Decided here so the popup can show the reason, and
+                        // so the apply queue cannot pick it up by accident.
+                        blocked: dependency_block(c, &containers),
                     });
                 }
                 Ok(_) => {}
@@ -561,6 +712,189 @@ mod tests {
         assert_eq!(r.registry, "localhost:5000");
         assert_eq!(r.repo, "my/app");
         assert_eq!(r.tag, "latest");
+    }
+
+    /// A container list entry, with only the fields the guard reads.
+    fn container(
+        id: &str,
+        name: &str,
+        state: &str,
+        network_mode: &str,
+        labels: &[(&str, &str)],
+    ) -> ApiContainer {
+        ApiContainer {
+            id: id.to_string(),
+            names: vec![format!("/{name}")],
+            image: "example/image:latest".to_string(),
+            image_id: format!("sha256:{name}"),
+            labels: labels
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            state: state.to_string(),
+            status: String::new(),
+            host_config: ApiHostConfig {
+                network_mode: network_mode.to_string(),
+            },
+        }
+    }
+
+    /// The 2026-09-09 outage: gluetun on :latest carrying qbittorrent and
+    /// flaresolverr in its network namespace. Both are tag-pinned, so gluetun
+    /// is the only one that ever appears as updatable — and it is the one that
+    /// must not be recreated alone.
+    fn vpn_stack() -> Vec<ApiContainer> {
+        let gluetun_id = "31099bfa11e8";
+        vec![
+            container(
+                gluetun_id,
+                "gluetun",
+                "running",
+                "bridge",
+                &[
+                    ("com.docker.compose.project", "qbittorrent-vpn"),
+                    ("com.docker.compose.service", "gluetun"),
+                    (
+                        "com.docker.compose.project.working_dir",
+                        "/mnt/Homelab-Apps/Apps_Data/Dockge/Stacks/qbittorrent-vpn",
+                    ),
+                ],
+            ),
+            container(
+                "aa",
+                "qbittorrent",
+                "running",
+                &format!("container:{gluetun_id}"),
+                &[
+                    ("com.docker.compose.project", "qbittorrent-vpn"),
+                    ("com.docker.compose.service", "qbittorrent"),
+                    ("com.docker.compose.depends_on", "gluetun:service_healthy:false"),
+                ],
+            ),
+            container(
+                "bb",
+                "flaresolverr",
+                "exited",
+                &format!("container:{gluetun_id}"),
+                &[
+                    ("com.docker.compose.project", "qbittorrent-vpn"),
+                    ("com.docker.compose.service", "flaresolverr"),
+                ],
+            ),
+            container("cc", "watchstate", "running", "bridge", &[]),
+        ]
+    }
+
+    #[test]
+    fn carrier_of_network_passengers_is_blocked() {
+        let all = vpn_stack();
+        let reason = dependency_block(&all[0], &all).expect("gluetun must be blocked");
+        assert!(reason.contains("qbittorrent"), "{reason}");
+        assert!(reason.contains("flaresolverr"), "{reason}");
+        assert!(reason.contains("new id"), "{reason}");
+        assert!(reason.contains("/Dockge/Stacks/qbittorrent-vpn"), "{reason}");
+    }
+
+    /// A stopped passenger is the case that cannot be restarted at all once
+    /// the carrier's id changes, so it must still block.
+    #[test]
+    fn stopped_passenger_still_blocks() {
+        let all = vpn_stack();
+        assert_eq!(
+            network_passengers(&all[0], &all),
+            vec!["qbittorrent".to_string(), "flaresolverr".to_string()]
+        );
+    }
+
+    /// Acceptance criterion: the guard must not block ordinary containers.
+    #[test]
+    fn standalone_container_is_not_blocked() {
+        let all = vpn_stack();
+        assert!(dependency_block(&all[3], &all).is_none());
+    }
+
+    #[test]
+    fn declared_dependency_blocks_without_a_shared_namespace() {
+        let all = vec![
+            container(
+                "d1",
+                "db",
+                "running",
+                "bridge",
+                &[
+                    ("com.docker.compose.project", "app"),
+                    ("com.docker.compose.service", "db"),
+                ],
+            ),
+            container(
+                "d2",
+                "web",
+                "running",
+                "bridge",
+                &[
+                    ("com.docker.compose.project", "app"),
+                    ("com.docker.compose.service", "web"),
+                    ("com.docker.compose.depends_on", "db:service_started:true,cache:x:false"),
+                ],
+            ),
+        ];
+        let reason = dependency_block(&all[0], &all).expect("db must be blocked");
+        assert!(reason.contains("web"), "{reason}");
+        // No working_dir label, so the advice falls back to compose itself.
+        assert!(reason.contains("docker compose up -d"), "{reason}");
+    }
+
+    #[test]
+    fn dependency_in_another_project_is_not_a_dependency() {
+        let all = vec![
+            container(
+                "e1",
+                "one",
+                "running",
+                "bridge",
+                &[
+                    ("com.docker.compose.project", "alpha"),
+                    ("com.docker.compose.service", "svc"),
+                ],
+            ),
+            container(
+                "e2",
+                "two",
+                "running",
+                "bridge",
+                &[
+                    ("com.docker.compose.project", "beta"),
+                    ("com.docker.compose.service", "other"),
+                    ("com.docker.compose.depends_on", "svc:service_started:false"),
+                ],
+            ),
+        ];
+        assert!(dependency_block(&all[0], &all).is_none());
+    }
+
+    #[test]
+    fn depends_on_is_parsed_out_of_its_condition_fields() {
+        assert_eq!(parse_depends_on("gluetun:service_healthy:false"), vec!["gluetun"]);
+        assert_eq!(parse_depends_on("a:x:false, b:y:true"), vec!["a", "b"]);
+        assert!(parse_depends_on("").is_empty());
+    }
+
+    /// Only running containers are candidates; the list is fetched with
+    /// `?all=1` purely so stopped dependents are visible.
+    #[test]
+    fn only_running_containers_are_candidates() {
+        let all = vpn_stack();
+        assert!(all[0].is_running());
+        assert!(!all[2].is_running());
+        // Older spelling, for a proxy that only forwards Status.
+        let mut older = container("f1", "old", "", "bridge", &[]);
+        older.status = "Up 3 days".to_string();
+        assert!(older.is_running());
+        older.status = "Exited (0) 2 hours ago".to_string();
+        assert!(!older.is_running());
+        // Neither field: keep updating rather than silently doing nothing.
+        let neither = container("f2", "neither", "", "bridge", &[]);
+        assert!(neither.is_running());
     }
 
     #[test]

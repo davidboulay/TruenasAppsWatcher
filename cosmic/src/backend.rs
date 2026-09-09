@@ -127,6 +127,21 @@ pub struct UpdateItem {
     /// Latest available catalog version. Empty for image updates.
     pub latest: String,
     pub kind: UpdateKind,
+    /// Why this item must not be applied from here, if it must not be.
+    ///
+    /// Set only for containers something else depends on: Portainer's recreate
+    /// replaces the container with a new id, which breaks anything pinned to
+    /// the old one. Such an item is still *listed* — an update that exists must
+    /// be visible even when this applet is the wrong tool for it — but it is
+    /// kept out of the apply queue. See `docker::dependency_block`.
+    #[allow(clippy::struct_field_names)]
+    pub blocked: Option<String>,
+}
+
+impl UpdateItem {
+    pub fn is_blocked(&self) -> bool {
+        self.blocked.is_some()
+    }
 }
 
 /// Progress events emitted while applying updates.
@@ -271,6 +286,7 @@ async fn query_apps(conn: &Connection) -> Result<AppsReport, String> {
                 current,
                 latest: app.latest_version.clone().unwrap_or_default(),
                 kind: UpdateKind::App,
+                blocked: None,
             });
         } else if app.image_updates_available {
             report.images.push(UpdateItem {
@@ -279,6 +295,7 @@ async fn query_apps(conn: &Connection) -> Result<AppsReport, String> {
                 current,
                 latest: String::new(),
                 kind: UpdateKind::Image,
+                blocked: None,
             });
         }
     }
@@ -377,6 +394,14 @@ pub fn apply_updates(
         for (i, item) in items.iter().enumerate() {
             let base = i as f32 / n;
             let _ = tx.unbounded_send(InstallEvent::Progress(base));
+            // Callers already filter these out, so arriving here would be a
+            // bug rather than a user action. Refuse anyway: the recreate below
+            // destroys the old container, and the cost of being wrong is an
+            // outage (see the 2026-09-09 gluetun incident).
+            if let Some(reason) = &item.blocked {
+                errors.push(format!("{}: {reason}", item.title));
+                continue;
+            }
             let result = match &item.kind {
                 UpdateKind::Container {
                     endpoint_id,

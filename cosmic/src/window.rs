@@ -200,9 +200,23 @@ impl Window {
         })
     }
 
-    /// Everything pending: TrueNAS app updates plus unmanaged containers.
+    /// Everything pending that this applet can actually apply: TrueNAS app
+    /// updates plus the unmanaged containers nothing else depends on.
+    ///
+    /// Containers something else depends on are deliberately excluded — they
+    /// are listed, but recreating them here would break their dependents, so
+    /// counting them would make the badge a call to an action that does not
+    /// exist. See `blocked_containers`.
     fn total_updates(&self) -> usize {
-        self.report.total() + self.containers.updates.len()
+        self.report.total() + self.applicable_containers().count()
+    }
+
+    fn applicable_containers(&self) -> impl Iterator<Item = &UpdateItem> {
+        self.containers.updates.iter().filter(|i| !i.is_blocked())
+    }
+
+    fn blocked_containers(&self) -> impl Iterator<Item = &UpdateItem> {
+        self.containers.updates.iter().filter(|i| i.is_blocked())
     }
 
     /// Query GitHub for the latest release tag in the background.
@@ -265,6 +279,9 @@ impl Window {
             };
             if !secondary.is_empty() {
                 info = info.push(text::caption(secondary));
+            }
+            if let Some(reason) = &item.blocked {
+                info = info.push(text::caption(reason.clone()));
             }
             col = col.push(padded_control(info).padding([space_xxs, 0]));
         }
@@ -556,7 +573,7 @@ impl cosmic::Application for Window {
                     .upgrades
                     .iter()
                     .chain(self.report.images.iter())
-                    .chain(self.containers.updates.iter())
+                    .chain(self.applicable_containers())
                     .cloned()
                     .collect();
                 let conn = self.conn.clone();
@@ -867,6 +884,16 @@ impl cosmic::Application for Window {
             text::body("TrueNAS not reachable")
         } else if self.checking || self.checking_containers {
             text::body("Checking for updates…")
+        } else if total == 0 && self.blocked_containers().count() > 0 {
+            // Nothing to apply, but something *is* pending. Saying "up to
+            // date" here would be a lie the user could only discover from
+            // Dockge, which is how the 2026-09-09 outage stayed invisible.
+            let n = self.blocked_containers().count();
+            text::body(format!(
+                "{n} update{} need{} a stack update",
+                if n == 1 { "" } else { "s" },
+                if n == 1 { "s" } else { "" }
+            ))
         } else if total == 0 {
             text::body(match (self.report.total_apps, self.containers.total_containers) {
                 (0, 0) => "No apps found".to_string(),
@@ -968,7 +995,15 @@ impl cosmic::Application for Window {
             sections = sections.push(s);
             any = true;
         }
-        if let Some(s) = self.section("Containers (Portainer)", &self.containers.updates) {
+        let applicable: Vec<UpdateItem> = self.applicable_containers().cloned().collect();
+        if let Some(s) = self.section("Containers (Portainer)", &applicable) {
+            sections = sections.push(s);
+            any = true;
+        }
+        // Listed, with the reason, and never applied. Hiding them would be
+        // claiming the update does not exist.
+        let blocked: Vec<UpdateItem> = self.blocked_containers().cloned().collect();
+        if let Some(s) = self.section("Needs a stack update", &blocked) {
             sections = sections.push(s);
             any = true;
         }

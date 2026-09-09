@@ -14,6 +14,38 @@ permissions:
   contents: write
 
 jobs:
+  # The COSMIC applet is only *built* on a tag (below), so until this job
+  # existed a push to main got no Rust compile check at all and breakage
+  # surfaced at release time. Swift has had that safety net on every push
+  # since the start; this gives Rust the same one, cheaply.
+  cosmic-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxkbcommon-dev libwayland-dev libdbus-1-dev \
+            libpulse-dev libpipewire-0.3-dev libinput-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cosmic
+
+      - name: Check
+        working-directory: cosmic
+        run: cargo check --locked --all-targets
+
+      - name: Tests
+        working-directory: cosmic
+        run: cargo test --locked
+
   macos:
     runs-on: macos-14
     steps:
@@ -85,7 +117,10 @@ jobs:
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
-    needs: [macos, linux]
+    # cosmic-check is in here for its `cargo test`: the linux job compiles the
+    # applet but never runs the tests, so without this a release could ship
+    # with the dependency guard broken.
+    needs: [cosmic-check, macos, linux]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
