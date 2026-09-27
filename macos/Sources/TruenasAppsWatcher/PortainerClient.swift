@@ -5,7 +5,8 @@
 // projects TrueNAS manages), "update available" means the image tag's digest
 // at the registry no longer matches a local RepoDigest, and applying an
 // update pulls the image (with streamed per-layer progress) then recreates
-// the container through Portainer.
+// the container through Portainer. Containers other containers depend on
+// are listed but never recreated (see `dependencyBlock`).
 
 import Foundation
 
@@ -46,12 +47,25 @@ struct PortainerClient {
         let image: String?
         let imageID: String?
         let labels: [String: String]?
+        let state: String?
+        let status: String?
+        let hostConfig: HostConfig?
         enum CodingKeys: String, CodingKey {
             case id = "Id"
             case names = "Names"
             case image = "Image"
             case imageID = "ImageID"
             case labels = "Labels"
+            case state = "State"
+            case status = "Status"
+            case hostConfig = "HostConfig"
+        }
+
+        struct HostConfig: Decodable {
+            let networkMode: String?
+            enum CodingKeys: String, CodingKey {
+                case networkMode = "NetworkMode"
+            }
         }
 
         var displayName: String {
@@ -67,6 +81,89 @@ struct PortainerClient {
         var isTrueNASManaged: Bool {
             (labels?["com.docker.compose.project"] ?? "").hasPrefix("ix-")
         }
+
+        /// Only a running container is a candidate for an update. The list is
+        /// fetched with `?all=1` so stopped *dependents* are visible to
+        /// `dependencyBlock`; without this filter that same flag would offer
+        /// to recreate — and thereby start — containers deliberately stopped.
+        /// A list carrying neither field is treated as running.
+        var isRunning: Bool {
+            if let state, !state.isEmpty { return state == "running" }
+            if let status, !status.isEmpty { return status.hasPrefix("Up") }
+            return true
+        }
+
+        func label(_ name: String) -> String { labels?[name] ?? "" }
+        var composeProject: String { label("com.docker.compose.project") }
+        var composeService: String { label("com.docker.compose.service") }
+        /// Where the stack's compose file lives, so a refusal can say where to go.
+        var stackWorkingDir: String { label("com.docker.compose.project.working_dir") }
+    }
+
+    // MARK: Dependency guard
+
+    /// `com.docker.compose.depends_on` is a comma-separated list of
+    /// `<service>:<condition>:<restart>` entries, e.g.
+    /// "gluetun:service_healthy:false".
+    private static func parseDependsOn(_ value: String) -> [String] {
+        value.split(separator: ",").compactMap { entry in
+            let name = entry.split(separator: ":").first
+                .map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+            return name.isEmpty ? nil : name
+        }
+    }
+
+    /// Containers riding this one's network namespace — the fatal case.
+    ///
+    /// compose's `network_mode: "service:x"` is stored by Docker per container
+    /// as a literal `HostConfig.NetworkMode = "container:<x-id>"`. Recreating x
+    /// gives it a *new* id, so the passenger's namespace target stops existing:
+    /// it cannot start ("No such container"), and one that was already running
+    /// can keep reporting healthy with no network at all.
+    private static func networkPassengers(_ target: ApiContainer, _ all: [ApiContainer]) -> [String] {
+        let needle = "container:\(target.id)"
+        return all
+            .filter { $0.id != target.id && $0.hostConfig?.networkMode == needle }
+            .map(\.displayName)
+    }
+
+    /// Containers in the same stack that declared a compose dependency on
+    /// this one's service.
+    private static func composeDependants(_ target: ApiContainer, _ all: [ApiContainer]) -> [String] {
+        let (project, service) = (target.composeProject, target.composeService)
+        if project.isEmpty || service.isEmpty { return [] }
+        return all
+            .filter { $0.id != target.id && $0.composeProject == project }
+            .filter { parseDependsOn($0.label("com.docker.compose.depends_on")).contains(service) }
+            .map(\.displayName)
+    }
+
+    /// Why this container must not be recreated on its own, if it must not be.
+    ///
+    /// Portainer's recreate is per container: it renames the old one aside,
+    /// creates a replacement with a new id, and destroys the original. Safe
+    /// for a standalone container, destructive for one anything else is
+    /// attached to. Refusing is the complete fix: recreating the dependents
+    /// afterwards reuses their config, which still names the dead id, and
+    /// only `docker compose up -d` re-resolves `service:x` to the new one.
+    private static func dependencyBlock(_ target: ApiContainer, _ all: [ApiContainer]) -> String? {
+        var names = networkPassengers(target, all)
+        for name in composeDependants(target, all) where !names.contains(name) {
+            names.append(name)
+        }
+        if names.isEmpty { return nil }
+        names.sort()
+        let shown = names.count > 3
+            ? "\(names.prefix(3).joined(separator: ", ")), +\(names.count - 3) more"
+            : names.joined(separator: ", ")
+        let one = names.count == 1
+        let head = "\(names.count) container\(one ? "" : "s") depend\(one ? "s" : "") on "
+            + "\(target.displayName) (\(shown)). Recreating it alone would give it a new id "
+            + "and break \(one ? "it" : "them")."
+        let dir = target.stackWorkingDir
+        return dir.isEmpty
+            ? "\(head) Update the whole stack instead (docker compose up -d)."
+            : "\(head) Update the stack instead: \(dir)"
     }
 
     private struct ImageInspect: Decodable {
@@ -105,7 +202,7 @@ struct PortainerClient {
             do {
                 let data = try await HTTP.data(
                     session,
-                    request("GET", "/api/endpoints/\(ep.id)/docker/containers/json"),
+                    request("GET", "/api/endpoints/\(ep.id)/docker/containers/json?all=1"),
                     label: "containers")
                 containers = try JSONDecoder().decode([ApiContainer].self, from: data)
             } catch {
@@ -114,7 +211,7 @@ struct PortainerClient {
             }
 
             for c in containers {
-                guard !c.isTrueNASManaged,
+                guard !c.isTrueNASManaged, c.isRunning,
                       let image = c.image, !image.isEmpty,
                       // Images pinned by digest or referenced by id can't drift.
                       !image.contains("@"), !image.hasPrefix("sha256:")
@@ -150,7 +247,8 @@ struct PortainerClient {
                         report.updates.append(UpdateItem(
                             name: c.displayName, title: c.displayName,
                             current: image, latest: "",
-                            kind: .container(endpointId: ep.id, containerId: c.id, image: image)))
+                            kind: .container(endpointId: ep.id, containerId: c.id, image: image),
+                            blocked: Self.dependencyBlock(c, containers)))
                     }
                 case .failure(let error):
                     report.errors.append("\(c.displayName) (\(image)): \(error.localizedDescription)")

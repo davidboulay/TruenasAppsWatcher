@@ -49,7 +49,8 @@ final class AppState: ObservableObject {
 
     private var timers: [Timer] = []
 
-    var totalUpdates: Int { report.total + containers.updates.count }
+    /// Updates that can be applied from here (blocked containers excluded).
+    var totalUpdates: Int { report.total + containers.applicable.count }
 
     var menuBarImage: NSImage {
         StatusIcon.image(count: totalUpdates, configured: trueNAS.isConfigured)
@@ -69,6 +70,10 @@ final class AppState: ObservableObject {
         }
         if checking || checkingContainers {
             return "Checking for updates…"
+        }
+        if totalUpdates == 0 && !containers.blocked.isEmpty {
+            let n = containers.blocked.count
+            return "\(n) container update\(n == 1 ? "" : "s") to apply per stack"
         }
         if totalUpdates == 0 {
             switch (report.totalApps, containers.totalContainers) {
@@ -186,7 +191,7 @@ final class AppState: ObservableObject {
         installing = true
         installProgress = nil
         installError = nil
-        let items = report.upgrades + report.images + containers.updates
+        let items = report.upgrades + report.images + containers.applicable
         let tnClient = TrueNASClient(trueNAS)
         let ptClient = PortainerClient(portainer)
 

@@ -83,6 +83,11 @@ struct UpdateItem: Identifiable, Equatable {
     /// Latest available version. Empty for image/container updates.
     let latest: String
     let kind: UpdateKind
+    /// Why this update must not be applied from here, if it must not be
+    /// (a container something else depends on — see `PortainerClient`).
+    var blocked: String? = nil
+
+    var isBlocked: Bool { blocked != nil }
 
     /// The secondary line shown under the title.
     var subtitle: String {
@@ -114,6 +119,11 @@ struct ContainerReport: Equatable {
     var errors: [String] = []
     /// Portainer wasn't reachable at all — see `AppsReport.unreachable`.
     var unreachable = false
+
+    /// Updates that can be applied from here.
+    var applicable: [UpdateItem] { updates.filter { !$0.isBlocked } }
+    /// Updates refused because other containers depend on the target.
+    var blocked: [UpdateItem] { updates.filter { $0.isBlocked } }
 }
 
 /// Where the app's own version sits relative to the latest GitHub release.

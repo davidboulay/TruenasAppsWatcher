@@ -76,7 +76,7 @@ struct PopoverView: View {
 
             errorLines
 
-            if state.totalUpdates > 0 {
+            if state.totalUpdates > 0 || !state.containers.blocked.isEmpty {
                 Divider()
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
@@ -89,7 +89,9 @@ struct PopoverView: View {
                 .frame(maxHeight: 280)
                 Divider()
 
-                if state.installing {
+                if state.totalUpdates == 0 {
+                    EmptyView()
+                } else if state.installing {
                     VStack(alignment: .leading, spacing: 4) {
                         if let p = state.installProgress {
                             Text("Updating… \(Int(p * 100))%")
@@ -203,6 +205,12 @@ struct PopoverView: View {
                         Text(item.subtitle)
                             .font(.caption)
                             .foregroundStyle(.secondary)
+                        if let reason = item.blocked {
+                            Label(reason, systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                     }
                 }
             }
