@@ -51,6 +51,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Test JSON-RPC client
+        working-directory: macos
+        run: swift test
+
       - name: Build (release, universal)
         working-directory: macos
         run: swift build -c release --arch arm64 --arch x86_64

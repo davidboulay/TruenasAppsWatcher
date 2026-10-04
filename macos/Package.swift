@@ -8,6 +8,12 @@ let package = Package(
         .executableTarget(
             name: "TruenasAppsWatcher",
             path: "Sources/TruenasAppsWatcher"
+        ),
+        .testTarget(
+            name: "TrueNASClientTests",
+            dependencies: ["TruenasAppsWatcher"],
+            path: "Tests",
+            exclude: ["Fixtures"]
         )
     ]
 )
