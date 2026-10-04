@@ -1,6 +1,6 @@
 [package]
 name = "cosmic-applet-truenas-apps"
-version = "0.4.6"
+version = "0.5.0"
 edition = "2024"
 license = "GPL-3.0-only"
 description = "TrueNAS Apps Watcher — a COSMIC panel applet that watches a TrueNAS server (and optionally Portainer) for pending Docker app updates and can apply them."
@@ -25,6 +25,10 @@ jiff = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# The TrueNAS middleware API is JSON-RPC 2.0 over a WebSocket (`/api/current`).
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"

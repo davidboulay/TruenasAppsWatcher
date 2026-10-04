@@ -2,16 +2,35 @@
 //
 // TrueNAS apps backend.
 //
-// Talks to the TrueNAS SCALE REST API (`/api/v2.0`) over HTTPS with an API
-// key. Queries the installed apps for pending upgrades (catalog version bumps
-// and newer Docker images), and drives the `app.upgrade` / `app.pull_images`
-// jobs to apply them. Long-running operations are middleware *jobs*: the call
-// returns a job id which is then polled via `core.get_jobs`.
+// Talks to the TrueNAS SCALE middleware over its JSON-RPC 2.0 WebSocket API
+// (`/api/current`, TrueNAS 25.04 and newer), authenticating the session with
+// an API key. Queries the installed apps for pending upgrades (catalog
+// version bumps and newer Docker images), and drives the `app.upgrade` /
+// `app.pull_images` jobs to apply them. Long-running operations are
+// middleware *jobs*: the call returns a job id which is then polled via
+// `core.get_jobs` on the same session.
+//
+// The REST layer (`/api/v2.0`) this used to speak is deprecated in 25.10 and
+// gone in 26.04; TrueNAS flags every call to it.
 
+use std::sync::Arc;
 use std::time::Duration;
 
+use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+use tokio_tungstenite::tungstenite::{self, Message};
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
+
+/// Where the JSON-RPC API lives, relative to the server's base URL.
+const API_PATH: &str = "/api/current";
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const CALL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Largest message accepted from the server. The apps list is the biggest
+/// legitimate reply at a few hundred kilobytes for a full NAS.
+const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
 
 /// How to reach the TrueNAS server. Persisted via cosmic-config and editable
 /// from the applet's settings panel.
@@ -53,48 +72,256 @@ impl Connection {
         }
     }
 
-    fn client(&self) -> Result<reqwest::Client, String> {
-        reqwest::Client::builder()
-            .danger_accept_invalid_certs(self.accept_invalid_certs)
-            .timeout(Duration::from_secs(30))
-            .build()
-            .map_err(|e| format!("HTTP client: {e}"))
+    /// The WebSocket URL of the JSON-RPC endpoint: `wss://` for an https base,
+    /// `ws://` for a box deliberately put back on plain http.
+    pub fn rpc_url(&self) -> String {
+        let base = self.normalized_base();
+        let ws = if let Some(rest) = base.strip_prefix("https://") {
+            format!("wss://{rest}")
+        } else if let Some(rest) = base.strip_prefix("http://") {
+            format!("ws://{rest}")
+        } else {
+            format!("wss://{base}")
+        };
+        format!("{ws}{API_PATH}")
     }
 
-    async fn request(
-        &self,
-        method: reqwest::Method,
-        path: &str,
-        body: Option<Value>,
-    ) -> Result<Value, String> {
-        let url = format!("{}{path}", self.normalized_base());
-        let mut req = self.client()?.request(method, &url).bearer_auth(self.api_key.trim());
-        if let Some(b) = body {
-            req = req.json(&b);
-        }
-        let resp = req
-            .send()
+    fn tls_connector(&self) -> Result<Connector, String> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| format!("TLS: {e}"))?;
+        let config = if self.accept_invalid_certs {
+            builder
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+                .with_no_client_auth()
+        } else {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            builder.with_root_certificates(roots).with_no_client_auth()
+        };
+        Ok(Connector::Rustls(Arc::new(config)))
+    }
+
+    /// Open a WebSocket to the middleware and log the session in with the
+    /// API key. Transport failures come back as "Could not reach TrueNAS
+    /// (…)", which callers treat as transient.
+    pub async fn connect(&self) -> Result<Session, String> {
+        let url = self.rpc_url();
+        let config = WebSocketConfig::default()
+            .max_message_size(Some(MAX_MESSAGE_BYTES))
+            .max_frame_size(Some(MAX_MESSAGE_BYTES));
+        let connecting = tokio_tungstenite::connect_async_tls_with_config(
+            url.as_str(),
+            Some(config),
+            false,
+            Some(self.tls_connector()?),
+        );
+        let (socket, _response) = tokio::time::timeout(CONNECT_TIMEOUT, connecting)
             .await
-            .map_err(|e| format!("Could not reach TrueNAS ({e})"))?;
-        let status = resp.status();
-        let text = resp.text().await.map_err(|e| format!("{path}: {e}"))?;
-        if !status.is_success() {
-            let snippet: String = text.chars().take(200).collect();
-            return Err(match status.as_u16() {
-                401 | 403 => "Authentication failed — check the API key".to_string(),
-                _ => format!("{path}: HTTP {status}: {snippet}"),
-            });
+            .map_err(|_| "Could not reach TrueNAS (timed out)".to_string())?
+            .map_err(connect_error)?;
+        let mut session = Session { socket, next_id: 0 };
+        // `auth.login_with_api_key` is the API-key front door of the JSON-RPC
+        // API: the server resolves the key's user and runs the API_KEY_PLAIN
+        // mechanism of `auth.login_ex` on its behalf.
+        let ok = session
+            .call("auth.login_with_api_key", json!([self.api_key.trim()]))
+            .await?;
+        if ok != Value::Bool(true) {
+            return Err("Authentication failed — check the API key".to_string());
         }
-        serde_json::from_str(&text).map_err(|e| format!("{path}: invalid JSON ({e})"))
+        Ok(session)
+    }
+}
+
+/// Accepts whatever certificate the server presents — the "self-signed
+/// certificate" toggle. Signatures are still checked, so the connection is
+/// at least talking to whoever holds the key for that certificate.
+#[derive(Debug)]
+struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
-    async fn get(&self, path: &str) -> Result<Value, String> {
-        self.request(reqwest::Method::GET, path, None).await
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
 
-    async fn post(&self, path: &str, body: Value) -> Result<Value, String> {
-        self.request(reqwest::Method::POST, path, Some(body)).await
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
     }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Why a connection attempt failed, in the words the UI shows. Everything
+/// that says nothing about the request itself — no route, refused, a proxy's
+/// 502/503/504, TLS trouble — is "Could not reach", so automatic checks
+/// retry quietly instead of alarming.
+fn connect_error(e: tungstenite::Error) -> String {
+    match e {
+        tungstenite::Error::Http(response) => {
+            let status = response.status().as_u16();
+            match status {
+                401 | 403 => "Authentication failed — check the API key".to_string(),
+                404 => format!(
+                    "No JSON-RPC endpoint at {API_PATH} — TrueNAS 25.04 or newer is required"
+                ),
+                408 | 502 | 503 | 504 | 522 | 524 => {
+                    format!("Could not reach TrueNAS (gateway returned HTTP {status})")
+                }
+                _ => format!("Could not reach TrueNAS (HTTP {status} during handshake)"),
+            }
+        }
+        tungstenite::Error::Url(e) => format!("Bad server address: {e}"),
+        tungstenite::Error::Tls(e) => {
+            let text = e.to_string();
+            if text.contains("certificate") || text.contains("Certificate") {
+                "Could not reach TrueNAS (certificate not trusted)".to_string()
+            } else {
+                format!("Could not reach TrueNAS (TLS: {text})")
+            }
+        }
+        tungstenite::Error::Io(e) => format!("Could not reach TrueNAS ({})", io_error_text(&e)),
+        other => format!("Could not reach TrueNAS ({other})"),
+    }
+}
+
+fn io_error_text(e: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    match e.kind() {
+        ErrorKind::ConnectionRefused => "connection refused".to_string(),
+        ErrorKind::ConnectionReset => "connection reset".to_string(),
+        ErrorKind::TimedOut => "timed out".to_string(),
+        ErrorKind::UnexpectedEof => "connection closed".to_string(),
+        _ => {
+            let text = e.to_string();
+            if text.contains("failed to lookup") || text.contains("Name or service") {
+                "host not found".to_string()
+            } else {
+                text
+            }
+        }
+    }
+}
+
+/// An authenticated JSON-RPC session on one WebSocket.
+pub struct Session {
+    socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    next_id: u64,
+}
+
+impl Session {
+    /// Make one call and wait for its reply. Notifications from the server
+    /// (collection updates and the like) are skipped; this client subscribes
+    /// to nothing.
+    pub async fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.next_id += 1;
+        let id = self.next_id;
+        let request = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.socket
+            .send(Message::Text(request.to_string().into()))
+            .await
+            .map_err(|e| format!("Could not reach TrueNAS ({})", transport_error(e)))?;
+        loop {
+            let next = tokio::time::timeout(CALL_TIMEOUT, self.socket.next())
+                .await
+                .map_err(|_| format!("Could not reach TrueNAS ({method}: no reply)"))?;
+            let message = match next {
+                None => return Err("Could not reach TrueNAS (connection closed)".to_string()),
+                Some(Err(e)) => {
+                    return Err(format!("Could not reach TrueNAS ({})", transport_error(e)));
+                }
+                Some(Ok(m)) => m,
+            };
+            let text = match message {
+                Message::Text(text) => text,
+                Message::Close(_) => {
+                    return Err("Could not reach TrueNAS (connection closed by TrueNAS)".to_string());
+                }
+                // Pings are answered by the library; pongs, binary frames
+                // and raw frames carry nothing for us.
+                _ => continue,
+            };
+            let reply: Value = serde_json::from_str(&text)
+                .map_err(|e| format!("{method}: invalid JSON from TrueNAS ({e})"))?;
+            if reply.get("id").and_then(Value::as_u64) != Some(id) {
+                continue;
+            }
+            if let Some(error) = reply.get("error") {
+                return Err(rpc_error(method, error));
+            }
+            return Ok(reply.get("result").cloned().unwrap_or(Value::Null));
+        }
+    }
+
+    /// Say goodbye. Errors are ignored: the session is over either way.
+    pub async fn close(mut self) {
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.socket.close(None)).await;
+    }
+}
+
+fn transport_error(e: tungstenite::Error) -> String {
+    match e {
+        tungstenite::Error::Io(e) => io_error_text(&e),
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => {
+            "connection closed".to_string()
+        }
+        tungstenite::Error::Capacity(e) => format!("reply too large: {e}"),
+        other => other.to_string(),
+    }
+}
+
+/// A JSON-RPC error object in a sentence. The middleware puts the useful
+/// text in `data.reason`; `data.errname` says whether it was a permissions
+/// problem (a key without the role for this call).
+fn rpc_error(method: &str, error: &Value) -> String {
+    let code = error.get("code").and_then(Value::as_i64);
+    let data = error.get("data");
+    let reason = data
+        .and_then(|d| d.get("reason"))
+        .and_then(Value::as_str)
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .unwrap_or("error");
+    let reason = reason.lines().next().unwrap_or("error").trim();
+    let reason: String = reason.chars().take(300).collect();
+    if code == Some(-32601) {
+        return format!("{method}: no such method on this TrueNAS version");
+    }
+    format!("{method}: {reason}")
 }
 
 /// What kind of update an app has pending.
@@ -222,28 +449,77 @@ struct JobProgress {
 }
 
 const JOB_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 /// Upgrades pull container images; give each job plenty of time.
 const JOB_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
+fn is_unreachable(e: &str) -> bool {
+    e.starts_with("Could not reach")
+}
+
+/// Make sure there is a live session, opening one if there isn't.
+async fn ensure_session(
+    conn: &Connection,
+    session: &mut Option<Session>,
+) -> Result<(), String> {
+    if session.is_none() {
+        *session = Some(conn.connect().await?);
+    }
+    Ok(())
+}
+
 /// Poll a job until it finishes. `on_progress` receives the job's own
 /// completion fraction (`0.0..=1.0`).
+///
+/// A dropped connection says nothing about the job, which is very likely
+/// still running on the NAS, so the poll comes back on a fresh session and
+/// keeps going; the deadline is the only honest limit on an image pull.
 async fn wait_job(
     conn: &Connection,
+    session: &mut Option<Session>,
     job_id: i64,
     on_progress: impl Fn(f32),
 ) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + JOB_TIMEOUT;
+    let mut missing = 0;
     loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(format!("Job {job_id} timed out"));
         }
-        let jobs: Vec<Job> = serde_json::from_value(
-            conn.get(&format!("/api/v2.0/core/get_jobs?id={job_id}")).await?,
-        )
-        .map_err(|e| format!("core.get_jobs: {e}"))?;
-        let Some(job) = jobs.first() else {
-            return Err(format!("Job {job_id} not found"));
+        if let Err(e) = ensure_session(conn, session).await {
+            if is_unreachable(&e) {
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+            return Err(e);
+        }
+        let Some(live) = session.as_mut() else { continue };
+        let reply = match live
+            .call("core.get_jobs", json!([[["id", "=", job_id]]]))
+            .await
+        {
+            Ok(v) => v,
+            Err(e) if is_unreachable(&e) => {
+                tracing::warn!("lost the session while watching job {job_id}: {e}");
+                *session = None;
+                tokio::time::sleep(RECONNECT_DELAY).await;
+                continue;
+            }
+            Err(e) => return Err(e),
         };
+        let jobs: Vec<Job> =
+            serde_json::from_value(reply).map_err(|e| format!("core.get_jobs: {e}"))?;
+        let Some(job) = jobs.first() else {
+            // A job can take a moment to appear right after it is created;
+            // only a persistent absence is a failure.
+            missing += 1;
+            if missing >= 3 {
+                return Err(format!("Job {job_id} not found"));
+            }
+            tokio::time::sleep(JOB_POLL_INTERVAL).await;
+            continue;
+        };
+        missing = 0;
         match job.state.as_str() {
             "SUCCESS" => return Ok(()),
             "FAILED" | "ABORTED" | "ERROR" => {
@@ -264,8 +540,8 @@ async fn wait_job(
 }
 
 /// Query the installed apps and sort out which have updates pending.
-async fn query_apps(conn: &Connection) -> Result<AppsReport, String> {
-    let raw: Vec<RawApp> = serde_json::from_value(conn.get("/api/v2.0/app").await?)
+async fn query_apps(session: &mut Session) -> Result<AppsReport, String> {
+    let raw: Vec<RawApp> = serde_json::from_value(session.call("app.query", json!([])).await?)
         .map_err(|e| format!("app.query: unexpected response ({e})"))?;
 
     let mut report = AppsReport {
@@ -318,13 +594,30 @@ pub async fn check_apps(conn: Connection, refresh: bool) -> AppsReport {
     }
 
     let mut errors = Vec::new();
+    let mut session = match conn.connect().await {
+        Ok(s) => Some(s),
+        Err(e) => {
+            let unreachable = is_unreachable(&e);
+            return AppsReport {
+                errors: vec![e],
+                unreachable,
+                ..AppsReport::default()
+            };
+        }
+    };
+
     if refresh {
         // A sync failure shouldn't hide the updates we can still read from the
-        // server's current state, so log it and carry on. `catalog.sync` takes
-        // no arguments, which the REST layer maps to GET (POST returns 405).
-        match conn.get("/api/v2.0/catalog/sync").await {
+        // server's current state, so log it and carry on. `catalog.sync` is a
+        // job: the call hands back an id and the work happens in the background.
+        let started = match session.as_mut() {
+            Some(live) => live.call("catalog.sync", json!([])).await,
+            None => Err("Could not reach TrueNAS (no session)".to_string()),
+        };
+        match started {
             Ok(Value::Number(id)) if id.as_i64().is_some() => {
-                if let Err(e) = wait_job(&conn, id.as_i64().unwrap(), |_| {}).await {
+                if let Err(e) = wait_job(&conn, &mut session, id.as_i64().unwrap(), |_| {}).await
+                {
                     tracing::warn!("catalog sync reported: {e}");
                 }
             }
@@ -332,17 +625,31 @@ pub async fn check_apps(conn: Connection, refresh: bool) -> AppsReport {
             Err(e) => {
                 tracing::warn!("catalog sync failed: {e}");
                 errors.push(format!("Catalog refresh failed: {e}"));
+                if is_unreachable(&e) {
+                    session = None;
+                }
             }
         }
     }
 
-    match query_apps(&conn).await {
+    let queried = match ensure_session(&conn, &mut session).await {
+        Ok(()) => match session.as_mut() {
+            Some(live) => query_apps(live).await,
+            None => Err("Could not reach TrueNAS (no session)".to_string()),
+        },
+        Err(e) => Err(e),
+    };
+    if let Some(live) = session.take() {
+        live.close().await;
+    }
+
+    match queried {
         Ok(mut report) => {
             report.errors.extend(errors);
             report
         }
         Err(e) => {
-            let unreachable = e.starts_with("Could not reach");
+            let unreachable = is_unreachable(&e);
             errors.push(e);
             AppsReport {
                 errors,
@@ -354,22 +661,19 @@ pub async fn check_apps(conn: Connection, refresh: bool) -> AppsReport {
 }
 
 /// Start the job that applies one pending update and return its id.
-async fn start_update_job(conn: &Connection, item: &UpdateItem) -> Result<i64, String> {
-    let (path, body) = match &item.kind {
+async fn start_update_job(session: &mut Session, item: &UpdateItem) -> Result<i64, String> {
+    let (method, params) = match &item.kind {
         // `app_version` defaults to "latest" server-side; spelled out for clarity.
         UpdateKind::App => (
-            "/api/v2.0/app/upgrade",
-            json!({ "app_name": item.name, "options": { "app_version": "latest" } }),
+            "app.upgrade",
+            json!([item.name, { "app_version": "latest" }]),
         ),
-        UpdateKind::Image => (
-            "/api/v2.0/app/pull_images",
-            json!({ "app_name": item.name }),
-        ),
+        UpdateKind::Image => ("app.pull_images", json!([item.name, { "redeploy": true }])),
         UpdateKind::Container { .. } => {
             return Err("container updates go through Portainer".to_string());
         }
     };
-    match conn.post(path, body).await? {
+    match session.call(method, params).await? {
         Value::Number(id) if id.as_i64().is_some() => Ok(id.as_i64().unwrap()),
         other => Err(format!("unexpected job response: {other}")),
     }
@@ -390,6 +694,9 @@ pub fn apply_updates(
     tokio::spawn(async move {
         let n = items.len().max(1) as f32;
         let mut errors = Vec::new();
+        // One session serves the whole queue; `wait_job` reopens it if the
+        // line drops mid-upgrade.
+        let mut session: Option<Session> = None;
 
         for (i, item) in items.iter().enumerate() {
             let base = i as f32 / n;
@@ -444,22 +751,40 @@ pub fn apply_updates(
                         }
                     }
                 }
-                _ => match start_update_job(&conn, item).await {
-                    Ok(job_id) => {
-                        let tx_p = tx.clone();
-                        wait_job(&conn, job_id, move |f| {
-                            let _ = tx_p.unbounded_send(InstallEvent::Progress(base + f / n));
-                        })
-                        .await
+                _ => {
+                    let started = match ensure_session(&conn, &mut session).await {
+                        Ok(()) => match session.as_mut() {
+                            Some(live) => start_update_job(live, item).await,
+                            None => Err("Could not reach TrueNAS (no session)".to_string()),
+                        },
+                        Err(e) => Err(e),
+                    };
+                    match started {
+                        Ok(job_id) => {
+                            let tx_p = tx.clone();
+                            wait_job(&conn, &mut session, job_id, move |f| {
+                                let _ =
+                                    tx_p.unbounded_send(InstallEvent::Progress(base + f / n));
+                            })
+                            .await
+                        }
+                        Err(e) => {
+                            if is_unreachable(&e) {
+                                session = None;
+                            }
+                            Err(e)
+                        }
                     }
-                    Err(e) => Err(e),
-                },
+                }
             };
             if let Err(e) = result {
                 errors.push(format!("{}: {e}", item.title));
             }
         }
 
+        if let Some(live) = session.take() {
+            live.close().await;
+        }
         let _ = tx.unbounded_send(InstallEvent::Progress(1.0));
         let result = if errors.is_empty() {
             Ok(())
@@ -469,4 +794,45 @@ pub fn apply_updates(
         let _ = tx.unbounded_send(InstallEvent::Done(result));
     });
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(base: &str) -> Connection {
+        Connection {
+            base_url: base.to_string(),
+            api_key: "1-key".to_string(),
+            accept_invalid_certs: true,
+        }
+    }
+
+    #[test]
+    fn rpc_url_follows_the_scheme_of_the_base() {
+        assert_eq!(conn("truenas.local").rpc_url(), "wss://truenas.local/api/current");
+        assert_eq!(conn("https://nas:8443/").rpc_url(), "wss://nas:8443/api/current");
+        assert_eq!(conn("http://192.168.1.10").rpc_url(), "ws://192.168.1.10/api/current");
+    }
+
+    #[test]
+    fn rpc_errors_read_the_middleware_reason() {
+        let e = json!({ "code": -32001, "message": "Method call error",
+                        "data": { "error": 13, "errname": "EACCES",
+                                  "reason": "Not authorized\nmore detail" } });
+        assert_eq!(rpc_error("app.upgrade", &e), "app.upgrade: Not authorized");
+        let missing = json!({ "code": -32601, "message": "Method does not exist" });
+        assert_eq!(
+            rpc_error("app.query", &missing),
+            "app.query: no such method on this TrueNAS version"
+        );
+        let bare = json!({ "code": -32602, "message": "Invalid params" });
+        assert_eq!(rpc_error("x", &bare), "x: Invalid params");
+    }
+
+    #[test]
+    fn transport_failures_are_unreachable() {
+        assert!(is_unreachable("Could not reach TrueNAS (connection refused)"));
+        assert!(!is_unreachable("Authentication failed — check the API key"));
+    }
 }

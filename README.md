@@ -54,9 +54,12 @@ runs on startup and on any manual check.
 
 ## Requirements
 
-- **TrueNAS SCALE** with the Docker-based apps system (24.10 "Electric Eel"
-  or newer; tested on 25.10). The app talks to the `/api/v2.0` REST
-  endpoints with a Bearer API key.
+- **TrueNAS SCALE 25.04 "Fangtooth" or newer** (tested on 25.10). The
+  COSMIC applet talks to the middleware's JSON-RPC 2.0 WebSocket API
+  (`/api/current`), logging the session in with the API key; the REST layer
+  (`/api/v2.0`) it used before is deprecated in 25.10 and removed in 26.04.
+  The macOS app still uses the REST layer, so it works on 24.10 and warns on
+  25.10.
 - A TrueNAS **API key**: TrueNAS web UI → click the ⚙ icon (top right) →
   **API Keys** → **Add**. Checking for updates only reads; applying updates
   calls `app.upgrade`, so use a full-access key (or a key limited to the app
